@@ -1,76 +1,194 @@
-# youtube_gen_v20.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+youtube_gen_v20 — SIFAS/스쿠스타 YouTube 설명(제목) 생성기.
 
-import os, sys, json, shutil, subprocess
+이 도구는 이제 브라우저 기반입니다 (sifas_fbx.py 와 동일한 방식).
+PySide6(Qt) 없이 파이썬 표준 라이브러리만으로 로컬 웹 서버를 띄우고,
+가능하면 독립 앱 창(pywebview)으로, 아니면 브라우저 창으로 UI를 엽니다.
+
+Usage
+    python3 youtube_gen_v20.py                 # 웹 UI 실행 (기본)
+    python3 youtube_gen_v20.py --web           # 동일 (명시적으로)
+    python3 youtube_gen_v20.py --no-browser    # 서버만 실행(창 안 열기; 원격/헤드리스)
+    python3 youtube_gen_v20.py --port 8780      # 포트 지정 (기본: 자동)
+    python3 youtube_gen_v20.py --data other.json   # 다른 데이터 파일 사용
+    python3 youtube_gen_v20.py selftest        # 생성 로직 자체 점검
+    python3 youtube_gen_v20.py generate --song "..." --artist "..." [옵션]  # 헤드리스 1회 생성
+    python3 youtube_gen_v20.py build-static    # 서버 없이 어디서나 열리는 index.html 생성
+
+데이터(youtube_data.json)는 스크립트 옆에 저장되며, 저장 시 원자적 쓰기 +
+번호 순환 백업(youtube_data_1..5.json)으로 보호됩니다.
+
+정적(브라우저 전용) 배포
+    `build-static` 는 현재 데이터를 통째로 넣은 단일 index.html 을 만듭니다. 이
+    파일은 서버가 전혀 필요 없어, 아이폰·안드로이드·PC·맥 어디서든 브라우저로
+    열기만 하면 동작하고(홈 화면에 앱처럼 설치 가능), GitHub Pages 등에 올리면
+    URL 하나로 공유됩니다. 편집 내용은 그 브라우저의 localStorage 에 저장되며,
+    기기 간 이동은 Export/Import(또는 저장소 커밋)로 합니다. 같은 index.html 을
+    youtube_gen_v20.py 가 서빙하면 자동으로 서버 모드로 전환되어 디스크의
+    youtube_data.json 을 직접 읽고 씁니다.
+"""
+
+import os
+import sys
+import json
+import shutil
+import argparse
+import threading
+import traceback
 from copy import deepcopy
 from pathlib import Path
 from datetime import datetime
 
-# ---------------- PySide6 imports (auto-install if missing) ----------------
-try:
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QAction, QGuiApplication
-    from PySide6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QMessageBox, QFileDialog,
-        QInputDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-        QPushButton, QListWidget, QListWidgetItem, QAbstractItemView,
-        QPlainTextEdit, QGroupBox, QLineEdit, QFrame, QScrollArea,
-        QCheckBox, QDialog, QTextEdit
-    )
-except ImportError:
-    print("PySide6가 없어 설치를 진행합니다...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "PySide6"])
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QAction, QGuiApplication
-    from PySide6.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QMessageBox, QFileDialog,
-        QInputDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-        QPushButton, QListWidget, QListWidgetItem, QAbstractItemView,
-        QPlainTextEdit, QGroupBox, QLineEdit, QFrame, QScrollArea,
-        QCheckBox, QDialog, QTextEdit
-    )
+# ---------------- Data file path ----------------
+DATA_FILE = str(Path(__file__).with_name("youtube_data.json"))
 
-from PySide6.QtWidgets import QDialog, QTextEdit
 
-class ImportJsonDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Import JSON values")
-        self.setMinimumSize(700, 500)
-        v = QVBoxLayout(self)
-        info = QLabel("JSON 값을 붙여넣거나, 파일에서 불러온 후 Import를 누르세요.")
-        self.edit = QPlainTextEdit()
-        self.edit.setPlaceholderText('예) {"songs": {...}, "song_categories": {...}} 또는 곧바로 songs 딕셔너리 형태')
-        btns = QHBoxLayout()
-        btn_load = QPushButton("Load from file...")
-        btn_clear = QPushButton("Clear")
-        btn_ok = QPushButton("Import")
-        btn_cancel = QPushButton("Cancel")
-        btns.addWidget(btn_load)
-        btns.addStretch(1)
-        btns.addWidget(btn_clear)
-        btns.addWidget(btn_ok)
-        btns.addWidget(btn_cancel)
-        v.addWidget(info)
-        v.addWidget(self.edit)
-        v.addLayout(btns)
+# ==========================================================================
+# Backup helpers: numbered rotation + atomic write
+# ==========================================================================
+def rotate_numbered_backups(json_path: str, max_backups: int = 5):
+    """
+    Same-directory numbered rotation:
+      youtube_data_5.json (oldest) removed
+      youtube_data_4.json -> _5.json
+      ...
+      youtube_data_1.json -> _2.json
+      youtube_data.json   -> youtube_data_1.json (if exists)
+    Returns the path of the newly created slot-1 backup, or None on first save.
+    """
+    p = Path(json_path).resolve()
 
-        def on_load():
-            fn, _ = QFileDialog.getOpenFileName(self, "Open JSON", "", "JSON (*.json)")
-            if not fn:
-                return
+    oldest = p.with_name(f"{p.stem}_{max_backups}.json")
+    if oldest.exists():
+        try:
+            oldest.unlink()
+        except Exception:
+            pass
+
+    for i in range(max_backups - 1, 0, -1):
+        src = p.with_name(f"{p.stem}_{i}.json")
+        dst = p.with_name(f"{p.stem}_{i+1}.json")
+        if src.exists():
             try:
-                with open(fn, "r", encoding="utf-8-sig") as f:
-                    self.edit.setPlainText(f.read())
-            except Exception as e:
-                QMessageBox.critical(self, "Load error", str(e))
+                src.replace(dst)
+            except Exception:
+                pass
 
-        btn_load.clicked.connect(on_load)
-        btn_clear.clicked.connect(lambda: self.edit.clear())
-        btn_cancel.clicked.connect(self.reject)
-        btn_ok.clicked.connect(self.accept)
+    out = None
+    if p.exists():
+        out = p.with_name(f"{p.stem}_1.json")
+        try:
+            shutil.copy2(p, out)
+        except Exception:
+            out = None
+    return str(out) if out else None
 
-    def get_text(self) -> str:
-        return self.edit.toPlainText()
+
+def atomic_write_json(json_path: str, data: dict):
+    """Write to a temp file, flush+fsync, then atomic replace (no partial writes)."""
+    p = Path(json_path).resolve()
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
+
+
+def append_import_log(base_path: str, level: str, message: str, detail: str = ""):
+    """Append a line to import.log next to the working data file."""
+    try:
+        p = Path(base_path)
+        log_path = p.with_name("import.log")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] [{level}] {message}"
+        if detail:
+            line += f"\n{detail}"
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ==========================================================================
+# Default data + ensure / normalize / merge
+# ==========================================================================
+def get_default_data():
+    return {
+        "songs": {},
+        "groups": {},
+        "characters": {},
+        "costumes": {},
+        "mods": {},
+        "song_categories": {"μ's": [], "Aqours": [], "Nijigasaki": [], "Solo": [], "Other": []},
+        "costume_categories": {"μ's": [], "Aqours": [], "Nijigasaki": [], "Event": []},
+        "character_costume_categories": {},
+        "settings": {
+            "aspect_ratios": ["16:9", "16:10", "4:3", "21:9"],
+            "format_order": ["{playlist}", "{hashtags}", "{japanese}", "{korean}", "{english}"],
+            "languages": ["japanese", "korean", "english"],
+            "japanese_format": "{song} ({artist}, {mod}, {costume})[{ratio}][スクスタ {type}]",
+            "korean_format": "{song} ({artist}, {mod}, {costume})[{ratio}][스쿠스타 {type}]",
+            "english_format": "{song} ({artist}, {mod}, {costume})[{ratio}][SIFAS {type}]",
+            "keep_mod_selection": False,
+            "enable_costume_category_filter": False,
+            "costume_category_whitelist": [],
+        },
+    }
+
+
+def normalize_data(data):
+    """Fill missing sections/settings and migrate legacy costume_categories.Character."""
+    default = get_default_data()
+    out = deepcopy(data) if isinstance(data, dict) else {}
+    for k, v in default.items():
+        if k not in out:
+            out[k] = deepcopy(v)
+    s = out.setdefault("settings", {})
+    for k, v in default["settings"].items():
+        s.setdefault(k, deepcopy(v) if isinstance(v, (list, dict)) else v)
+    out.setdefault("character_costume_categories", {})
+
+    # legacy migration: costume_categories["Character"] -> character_costume_categories
+    cc = out.get("costume_categories", {})
+    if isinstance(cc, dict) and "Character" in cc and isinstance(cc["Character"], dict):
+        for ch, lst in cc["Character"].items():
+            if not isinstance(lst, list):
+                continue
+            uniq, seen = [], set()
+            for key in lst:
+                if key in out.get("costumes", {}) and key not in seen:
+                    uniq.append(key)
+                    seen.add(key)
+            base = out.setdefault("character_costume_categories", {}).get(ch, {})
+            merged = list(base.get("Default", []))
+            for k in uniq:
+                if k not in merged:
+                    merged.append(k)
+            out.setdefault("character_costume_categories", {}).setdefault(ch, {})["Default"] = merged
+        try:
+            del out["costume_categories"]["Character"]
+        except Exception:
+            pass
+    return out
+
+
+def ensure_data(path=DATA_FILE):
+    """Load (creating if missing), normalize, and persist the working data file."""
+    p = Path(path).resolve()
+    if not p.exists():
+        atomic_write_json(path, get_default_data())
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        data = get_default_data()
+    data = normalize_data(data)
+    atomic_write_json(path, data)
+    return data
+
 
 def _merge_list_unique(base_list, add_list):
     if not isinstance(base_list, list):
@@ -83,12 +201,14 @@ def _merge_list_unique(base_list, add_list):
             seen.add(x)
     return out
 
+
 def merge_data_non_destructive(dst: dict, src: dict) -> dict:
+    """Merge src into dst without overwriting existing values. Returns stats."""
     stats = {
         "songs_added": 0, "groups_added": 0, "characters_added": 0,
         "costumes_added": 0, "mods_added": 0,
         "song_cat_updates": 0, "costume_cat_updates": 0, "char_costume_cat_updates": 0,
-        "settings_filled": 0
+        "settings_filled": 0,
     }
 
     for sec, key_stat in [
@@ -103,25 +223,22 @@ def merge_data_non_destructive(dst: dict, src: dict) -> dict:
             if k not in dst[sec]:
                 dst[sec][k] = v
                 stats[key_stat] += 1
-            else:
-                if isinstance(dst[sec][k], dict) and isinstance(v, dict):
-                    for sk, sv in v.items():
-                        if sk not in dst[sec][k]:
-                            dst[sec][k][sk] = sv
+            elif isinstance(dst[sec][k], dict) and isinstance(v, dict):
+                for sk, sv in v.items():
+                    if sk not in dst[sec][k]:
+                        dst[sec][k][sk] = sv
 
     dst.setdefault("song_categories", {})
     for cat, arr in (src.get("song_categories") or {}).items():
         before = len(dst["song_categories"].get(cat, []))
         dst["song_categories"][cat] = _merge_list_unique(dst["song_categories"].get(cat, []), arr)
-        after = len(dst["song_categories"][cat])
-        stats["song_cat_updates"] += max(0, after - before)
+        stats["song_cat_updates"] += max(0, len(dst["song_categories"][cat]) - before)
 
     dst.setdefault("costume_categories", {})
     for cat, arr in (src.get("costume_categories") or {}).items():
         before = len(dst["costume_categories"].get(cat, []))
         dst["costume_categories"][cat] = _merge_list_unique(dst["costume_categories"].get(cat, []), arr)
-        after = len(dst["costume_categories"][cat])
-        stats["costume_cat_updates"] += max(0, after - before)
+        stats["costume_cat_updates"] += max(0, len(dst["costume_categories"][cat]) - before)
 
     dst.setdefault("character_costume_categories", {})
     for ch, cmap in (src.get("character_costume_categories") or {}).items():
@@ -142,1410 +259,1459 @@ def merge_data_non_destructive(dst: dict, src: dict) -> dict:
 
     return stats
 
-def append_import_log(base_path: str, level: str, message: str, detail: str = ""):
-    """
-    base_path: 현재 작업 파일 경로(self.data_path)
-    같은 폴더에 import.log로 누적 기록
-    """
-    try:
-        p = Path(base_path)
-        log_path = p.with_name("import.log")
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] [{level}] {message}"
-        if detail:
-            line += f"\n{detail}"
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-# ---------------- Data file path ----------------
-DATA_FILE = str(Path(__file__).with_name("youtube_data.json"))
 
-# ---------------- Backup helpers: numbered rotation + atomic write ----------------
-def rotate_numbered_backups(json_path: str, max_backups: int = 5):
-    """
-    Same directory numbered rotation:
-      youtube_data_5.json (oldest) removed
-      youtube_data_4.json -> _5.json
-      ...
-      youtube_data_1.json -> _2.json
-      youtube_data.json   -> youtube_data_1.json (if exists)
-    """
-    p = Path(json_path).resolve()
+def looks_like_songs_map(d: dict) -> bool:
+    """True if d looks like a bare {name: {japanese/korean/english}} songs map."""
+    if not isinstance(d, dict):
+        return False
+    cnt, hit = 0, 0
+    for v in list(d.values())[:10]:
+        cnt += 1
+        if isinstance(v, dict) and any(k in v for k in ("japanese", "korean", "english")):
+            hit += 1
+    return cnt > 0 and hit / cnt >= 0.6
 
-    # 1) delete oldest
-    oldest = p.with_name(f"{p.stem}_{max_backups}.json")
-    if oldest.exists():
+
+# ==========================================================================
+# Description generation (ported from the old Qt generate(); pure function)
+# ==========================================================================
+def _pick(d, lng, fallback):
+    return d[lng] if isinstance(d, dict) and lng in d else fallback
+
+
+def _clean_line(s):
+    """Collapse empty {mod}/{costume} placeholders. Applied repeatedly until stable
+    so that even the both-empty case (plain MV: no mod, no costume) reads cleanly,
+    e.g. '(Artist, , )' -> '(Artist)'. The old Qt tool did a single pass and left a
+    trailing ', '."""
+    for _ in range(6):
+        before = s
+        s = s.replace("(, ", "(").replace(", )", ")").replace("()", "").replace(", ,", ",").strip()
+        if s == before:
+            break
+    return s
+
+
+def generate_description(data: dict, sel: dict) -> str:
+    """
+    Build the localized YouTube description text.
+
+    sel keys: atype ("groups"|"characters"), artist, song, costume, ratio,
+              vtype ("MOD"|"MV"), mods (list), solos (list of character keys).
+    """
+    settings = data.get("settings", {})
+    languages = settings.get("languages", ["japanese", "korean", "english"])
+    at = sel.get("atype", "groups")
+    ak = sel.get("artist", "") or ""
+    sk = sel.get("song", "") or ""
+    sd = data.get("songs", {}).get(sk, {}) or {}
+    ck = sel.get("costume", "") or ""
+    cd = data.get("costumes", {}).get(ck, {}) or {}
+    ar = sel.get("ratio", "") or ""
+    tp = sel.get("vtype", "MOD") or "MOD"
+    ms = list(sel.get("mods", []) or [])
+    cpl = (cd.get("costume_playlist") or "").strip()
+
+    if at == "characters":
+        sels = list(sel.get("solos", []) or [])
+        if not sels and ak:
+            sels = [ak]
+        chars = data.get("characters", {})
+        ad_list = [chars.get(k, {}) for k in sels if k in chars]
+        multiple_solo = len(ad_list) >= 2
+        apls = [(ad.get("artist_playlist") or "").strip() for ad in ad_list]
+        apl = "" if multiple_solo else (apls[0] if apls else "")
+
+        if apl and cpl:
+            playlist_line = f"{sels[0]} playlist : {apl} | Costume playlist : {cpl}"
+        elif cpl:
+            playlist_line = f"Costume playlist : {cpl}"
+        elif apl:
+            playlist_line = f"{sels[0]} playlist : {apl}"
+        else:
+            playlist_line = ""
+
+        def artist_str(lng):
+            return ", ".join(_pick(chars.get(k, {}), lng, k) for k in sels)
+
+        extra_ht = " ".join(ad.get("hashtags", "") for ad in ad_list if ad.get("hashtags"))
+    else:
+        ad = data.get("groups", {}).get(ak, {}) or {}
+        apl = (ad.get("artist_playlist") or "").strip()
+        if apl and cpl:
+            playlist_line = f"{ak} playlist : {apl} | Costume playlist : {cpl}"
+        elif cpl:
+            playlist_line = f"Costume playlist : {cpl}"
+        elif apl:
+            playlist_line = f"{ak} playlist : {apl}"
+        else:
+            playlist_line = ""
+
+        def artist_str(lng):
+            return _pick(ad, lng, ak)
+
+        extra_ht = ad.get("hashtags", "") or ""
+
+    mods = data.get("mods", {})
+
+    def mod_str(lng):
+        arr = []
+        for m in ms:
+            md = mods.get(m)
+            if not md:
+                continue
+            nm = _pick(md, lng, m)
+            if md.get("has_value"):
+                v = md.get("default_value", "") or ""
+                arr.append(f"{nm}({v})" if v else nm)
+            else:
+                arr.append(nm)
+        return ", ".join(arr)
+
+    def cos_str(lng):
+        nm = cd.get(lng, "") or ""
+        if not nm:
+            return ""
+        if lng == "japanese":
+            return f"{nm}衣装"
+        if lng == "korean":
+            return f"{nm} 의상"
+        return f"{nm} Costume"
+
+    ht = "#スクスタ #SIFAS #스쿠스타 #lovelive #ラブライブ"
+    if tp == "MOD":
+        ht += " #MOD"
+    if extra_ht:
+        ht += " " + extra_ht
+
+    vars_map = {"playlist": playlist_line, "hashtags": ht}
+    for lng in languages:
+        fmt = settings.get(f"{lng}_format", "")
+        mp = {
+            "song": _pick(sd, lng, sk),
+            "artist": artist_str(lng),
+            "mod": mod_str(lng),
+            "costume": cos_str(lng),
+            "ratio": f"[{ar}]" if ar else "",
+            "type": tp,
+        }
         try:
-            oldest.unlink()
+            line = _clean_line(fmt.format(**mp))
+        except Exception:
+            line = "Format Error"
+        vars_map[lng] = line
+
+    out_lines = []
+    for item in settings.get("format_order", []):
+        key = item.strip("{}")
+        if vars_map.get(key):
+            out_lines.append(vars_map[key])
+    return "\n".join(out_lines)
+
+
+# ==========================================================================
+# Embedded web page (HTML + CSS + vanilla JS). Mirrors the old Qt UI.
+# ==========================================================================
+_WEB_PAGE = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<title>YouTube 설명 생성기</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1e1f22">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="YT설명">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235865f2'/%3E%3Ctext y='.92em' x='6' font-size='74'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E">
+<style>
+*{box-sizing:border-box}
+:root{--bg:#1e1f22;--card:#2b2d31;--card2:#26282c;--in:#1a1b1e;--bd:#3a3d44;--fg:#e4e6ea;--mut:#9aa6b2;--acc:#5865f2;--acc2:#4752c4;--ok:#57b97f;--warn:#e0a63c;--del:#d05a5a}
+body{font-family:-apple-system,Segoe UI,Roboto,'Noto Sans KR',sans-serif;margin:0;background:var(--bg);color:var(--fg);font-size:14px}
+header{position:sticky;top:0;z-index:20;background:#1a1b1e;border-bottom:1px solid #000;padding:9px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header h1{font-size:16px;margin:0;font-weight:700}
+.toolbar{margin-left:auto;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+#status{font-size:12px;color:var(--mut);min-width:80px;text-align:right}
+#status.dirty{color:var(--warn)} #status.ok{color:var(--ok)} #status.err{color:var(--del)}
+.cols{display:flex;gap:14px;align-items:flex-start;max-width:1180px;margin:14px auto;padding:0 16px}
+.col{flex:1;min-width:0;display:flex;flex-direction:column;gap:14px}
+@media(max-width:860px){.cols{flex-direction:column}}
+.card{background:var(--card);border-radius:11px;padding:14px}
+.card h2{font-size:12px;letter-spacing:.04em;text-transform:uppercase;color:var(--mut);margin:0 0 11px;font-weight:700}
+label{display:block;font-size:12px;color:var(--mut);margin:10px 0 3px}
+label.first{margin-top:0}
+.row{display:flex;gap:6px;align-items:center}
+.row.wrap{flex-wrap:wrap}
+select,input[type=text]{width:100%;background:var(--in);border:1px solid var(--bd);color:var(--fg);border-radius:7px;padding:8px;font-size:13px;font-family:inherit}
+select:focus,input:focus{outline:none;border-color:var(--acc)}
+button{background:#40444b;color:var(--fg);border:0;border-radius:7px;padding:8px 11px;cursor:pointer;font-size:13px;font-family:inherit;white-space:nowrap}
+button:hover{filter:brightness(1.12)}
+button.icon{padding:8px 10px;font-weight:700;line-height:1}
+button.primary{background:var(--acc);color:#fff;font-weight:600}
+button.ghost{background:#3a3d44}
+button.danger:hover{background:var(--del);color:#fff}
+button.sm{padding:5px 9px;font-size:12px}
+.pill{background:var(--acc);color:#fff}
+.hint{color:#7c8590;font-size:11.5px;margin:8px 2px 0;line-height:1.5}
+.hint code{background:#00000055;padding:1px 5px;border-radius:4px;color:#bcd}
+.list{background:var(--in);border:1px solid var(--bd);border-radius:7px;max-height:190px;overflow:auto;padding:4px}
+.list .it{padding:6px 8px;border-radius:5px;cursor:pointer;font-size:13px;user-select:none;display:flex;gap:8px;align-items:center}
+.list .it:hover{background:#ffffff10}
+.list .it.sel{background:var(--acc);color:#fff}
+.list .it input{margin:0}
+.list.empty{color:var(--mut);font-size:12px;padding:10px;text-align:center}
+.chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--fg);margin:8px 0;cursor:pointer}
+.chk input{width:auto;margin:0}
+#preview{white-space:pre-wrap;word-break:break-word;background:var(--in);border:1px solid var(--bd);border-radius:8px;padding:12px;min-height:130px;font-size:13.5px;line-height:1.6;-webkit-user-select:text;user-select:text}
+.hidden{display:none!important}
+.grow{flex:1;min-width:0}
+.tag{font-size:11px;color:var(--mut)}
+.modal-bg{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:100;padding:16px}
+.modal{background:var(--card);border-radius:12px;padding:18px;width:100%;max-width:460px;max-height:90vh;overflow:auto}
+.modal h3{margin:0 0 12px;font-size:15px}
+.modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#000d;color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:200;opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:1}
+textarea{width:100%;background:var(--in);border:1px solid var(--bd);color:var(--fg);border-radius:7px;padding:9px;font-size:13px;font-family:ui-monospace,Menlo,monospace;min-height:220px;resize:vertical}
+</style></head><body>
+<header>
+  <h1>🎬 YouTube 설명 생성기</h1>
+  <div class="toolbar">
+    <span id="modeBadge" class="tag" title="저장 위치"></span>
+    <span id="status"></span>
+    <button class="sm" onclick="loadFromFile()">불러오기</button>
+    <button class="sm" onclick="doBackup()">백업</button>
+    <button class="sm" onclick="openImport()">Import</button>
+    <button class="sm" onclick="exportData()">Export ⭳</button>
+    <button class="sm primary" onclick="saveNow()">저장</button>
+  </div>
+</header>
+
+<div class="cols">
+ <!-- ================= LEFT ================= -->
+ <div class="col">
+  <div class="card">
+   <h2>선택 / 관리</h2>
+
+   <label class="first">Artist Type</label>
+   <select id="atype" onchange="onAtype()"><option>groups</option><option>characters</option></select>
+
+   <label>Artist</label>
+   <div class="row">
+    <select id="artist" class="grow" onchange="onArtist()"></select>
+    <button class="icon" title="추가" onclick="crudArtist('add')">＋</button>
+    <button class="icon" title="편집" onclick="crudArtist('edit')">✎</button>
+    <button class="icon danger" title="삭제" onclick="crudArtist('del')">✕</button>
+   </div>
+   <div class="row" id="soloAddRow" style="margin-top:6px">
+    <button class="sm grow" onclick="soloAdd()">＋ 현재 Artist를 Solo에 추가</button>
+   </div>
+
+   <label>Song</label>
+   <div class="row" style="margin-bottom:6px">
+    <span class="tag">Category</span>
+    <select id="songCat" class="grow" onchange="onSongCat()"></select>
+   </div>
+   <div class="row">
+    <select id="song" class="grow" onchange="onSong()"></select>
+    <button class="icon" title="추가" onclick="crudSong('add')">＋</button>
+    <button class="icon" title="편집" onclick="crudSong('edit')">✎</button>
+    <button class="icon danger" title="삭제" onclick="crudSong('del')">✕</button>
+   </div>
+
+   <div id="soloBox">
+    <label>Selected Solos</label>
+    <div class="list" id="soloList"></div>
+    <div class="row wrap" style="margin-top:6px">
+     <button class="sm" onclick="soloDel()">선택 제거</button>
+     <button class="sm" onclick="soloClear()">모두 지우기</button>
+    </div>
+   </div>
+
+   <label>Costume</label>
+   <div class="row" style="margin-bottom:6px">
+    <span class="tag">Category</span>
+    <select id="costumeCat" class="grow" onchange="onCostumeCat()"></select>
+   </div>
+   <div class="row">
+    <select id="costume" class="grow" onchange="onCostume()"></select>
+    <button class="icon" title="추가" onclick="crudCostume('add')">＋</button>
+    <button class="icon" title="편집" onclick="crudCostume('edit')">✎</button>
+    <button class="icon danger" title="삭제" onclick="crudCostume('del')">✕</button>
+   </div>
+   <div class="row" style="margin-top:6px">
+    <button class="sm ghost grow" onclick="noCostume()">No Costume (의상 없음)</button>
+   </div>
+  </div>
+
+  <div class="card">
+   <h2>Costume 필터</h2>
+   <label class="chk"><input type="checkbox" id="cfEnable" onchange="onFilterChange()"> 카테고리 화이트리스트 사용</label>
+   <div class="list" id="cfList"></div>
+   <div class="hint">체크한 카테고리에 속한 의상만 Costume 목록에 표시됩니다.</div>
+  </div>
+
+  <div class="card" id="charcosCard">
+   <h2>CharacterCostume (캐릭터별)</h2>
+   <div class="tag" id="charcosWho" style="margin-bottom:6px"></div>
+   <label class="first">Category</label>
+   <div class="row">
+    <select id="ccCat" class="grow" onchange="renderCharcos()"></select>
+    <button class="icon" title="카테고리 추가" onclick="ccCatAdd()">＋</button>
+    <button class="icon" title="이름 변경" onclick="ccCatRename()">✎</button>
+    <button class="icon danger" title="카테고리 삭제" onclick="ccCatDel()">✕</button>
+   </div>
+   <label>이 카테고리의 의상 (클릭 → Costume 선택)</label>
+   <div class="list" id="ccList"></div>
+   <label>카테고리에 의상 추가</label>
+   <div class="row">
+    <select id="ccAdd" class="grow"></select>
+    <button class="sm" onclick="ccAddToCat()">추가</button>
+    <button class="sm danger" onclick="ccRemoveFromCat()">선택 제거</button>
+   </div>
+  </div>
+
+  <div class="card">
+   <h2>Mods</h2>
+   <div class="row wrap" style="margin-bottom:8px">
+    <button class="sm" onclick="crudMod('add')">＋ 추가</button>
+    <button class="sm" onclick="crudMod('edit')">✎ 편집</button>
+    <button class="sm danger" onclick="crudMod('del')">✕ 삭제</button>
+   </div>
+   <div class="list" id="modList"></div>
+  </div>
+
+  <div class="card">
+   <h2>옵션</h2>
+   <label class="first">Aspect Ratio</label>
+   <div class="row">
+    <select id="ratio" class="grow" onchange="onRatio()"></select>
+    <button class="sm" onclick="editRatios()">편집</button>
+   </div>
+   <label>Video Type</label>
+   <select id="vtype" onchange="onVtype()"><option>MOD</option><option>MV</option></select>
+  </div>
+ </div>
+
+ <!-- ================= RIGHT ================= -->
+ <div class="col">
+  <div class="card">
+   <h2>미리보기</h2>
+   <div id="preview"></div>
+   <div class="row" style="margin-top:10px">
+    <button class="primary grow" onclick="copyOut()">📋 클립보드로 복사</button>
+   </div>
+  </div>
+
+  <div class="card">
+   <h2>줄 순서 (Line Order)</h2>
+   <div class="list" id="orderList"></div>
+   <div class="row wrap" style="margin-top:8px">
+    <button class="sm" onclick="orderMove(-1)">⬆️ 위로</button>
+    <button class="sm" onclick="orderMove(1)">⬇️ 아래로</button>
+   </div>
+   <div class="hint">사용 가능한 줄: <code>{playlist}</code> <code>{japanese}</code> <code>{korean}</code> <code>{english}</code> <code>{hashtags}</code></div>
+  </div>
+
+  <div class="card">
+   <h2>포맷 (언어별 제목 템플릿)</h2>
+   <div id="fmtBox"></div>
+   <div class="hint">사용 가능한 변수: <code>{song}</code> <code>{artist}</code> <code>{mod}</code> <code>{costume}</code> <code>{ratio}</code> <code>{type}</code></div>
+  </div>
+ </div>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toast" class="toast"></div>
+
+<script>
+"use strict";
+// ---------------- state ----------------
+let DATA = null;
+const S = { atype:"groups", artist:"", songCat:"All", song:"", costumeCat:"All",
+            costume:"", ratio:"", vtype:"MOD", mods:[], solos:[], ccCat:"" };
+let saveTimer = null;
+
+function el(id){ return document.getElementById(id); }
+function setStatus(t, cls){ const s=el('status'); s.textContent=t; s.className=cls||''; }
+function toast(t){ const e=el('toast'); e.textContent=t; e.classList.add('show'); setTimeout(()=>e.classList.remove('show'),1400); }
+
+// ---------------- storage: server API, or static (localStorage) ----------------
+// The same page runs two ways. When served by youtube_gen_v20.py the /api/*
+// endpoints read/write youtube_data.json on disk. When opened as a standalone
+// file / hosted statically (GitHub Pages), there is no server: data lives in this
+// browser's localStorage, seeded once from the baked-in window.__SEED__.
+let MODE = 'server';
+const LS_KEY = 'youtube_gen_data_v20';
+async function apiGet(u){ const r=await fetch(u); return r.json(); }
+async function apiPost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
+
+function markDirty(){
+  setStatus('● 저장 안 됨','dirty');
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(saveNow, 600);
+}
+async function saveNow(){
+  clearTimeout(saveTimer);
+  if(MODE==='static'){
+    try{ localStorage.setItem(LS_KEY, JSON.stringify(DATA)); setStatus('저장됨(이 브라우저) ✓','ok'); }
+    catch(e){ setStatus('저장 실패: '+e,'err'); }
+    return;
+  }
+  setStatus('저장 중…');
+  try{
+    const j=await apiPost('/api/save',{data:DATA});
+    if(j.ok) setStatus('저장됨 ✓ '+(j.time||''),'ok');
+    else setStatus('저장 실패','err');
+  }catch(e){ setStatus('저장 실패: '+e,'err'); }
+}
+async function doBackup(){
+  if(MODE==='static'){ exportData(true); return; }
+  const j=await apiPost('/api/backup',{});
+  toast(j.ok?('백업 생성: '+(j.name||'')):'백업 실패');
+}
+function pad2(n){ return (''+n).padStart(2,'0'); }
+function exportData(isBackup){
+  const blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob), a=document.createElement('a');
+  let name='youtube_data.json';
+  if(isBackup){ const d=new Date();
+    name='youtube_data_backup_'+d.getFullYear()+pad2(d.getMonth()+1)+pad2(d.getDate())+'_'+pad2(d.getHours())+pad2(d.getMinutes())+pad2(d.getSeconds())+'.json'; }
+  a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
+  toast((isBackup?'백업 내려받음: ':'내보냄: ')+name);
+}
+function loadFromFile(){
+  const fi=document.createElement('input'); fi.type='file'; fi.accept='.json,application/json';
+  fi.onchange=()=>{ const f=fi.files&&fi.files[0]; if(!f) return; const rd=new FileReader();
+    rd.onload=()=>{ try{ DATA=normalizeData(JSON.parse(rd.result)); renderAll(); saveNow(); toast('불러옴: '+f.name); }
+      catch(e){ toast('불러오기 실패: '+e); } };
+    rd.readAsText(f); };
+  fi.click();
+}
+
+// ---------------- data-model ports (mirror the Python helpers) ----------------
+function deepCopy(o){ return JSON.parse(JSON.stringify(o)); }
+function getDefaultData(){ return {
+  songs:{}, groups:{}, characters:{}, costumes:{}, mods:{},
+  song_categories:{"μ's":[],"Aqours":[],"Nijigasaki":[],"Solo":[],"Other":[]},
+  costume_categories:{"μ's":[],"Aqours":[],"Nijigasaki":[],"Event":[]},
+  character_costume_categories:{},
+  settings:{ aspect_ratios:["16:9","16:10","4:3","21:9"],
+    format_order:["{playlist}","{hashtags}","{japanese}","{korean}","{english}"],
+    languages:["japanese","korean","english"],
+    japanese_format:"{song} ({artist}, {mod}, {costume})[{ratio}][スクスタ {type}]",
+    korean_format:"{song} ({artist}, {mod}, {costume})[{ratio}][스쿠스타 {type}]",
+    english_format:"{song} ({artist}, {mod}, {costume})[{ratio}][SIFAS {type}]",
+    keep_mod_selection:false, enable_costume_category_filter:false, costume_category_whitelist:[] } };
+}
+function normalizeData(data){
+  const def=getDefaultData();
+  const out=(data && typeof data==='object' && !Array.isArray(data)) ? deepCopy(data) : {};
+  for(const k in def){ if(!(k in out)) out[k]=deepCopy(def[k]); }
+  const s=out.settings||(out.settings={});
+  for(const k in def.settings){ if(!(k in s)) s[k]=(def.settings[k]&&typeof def.settings[k]==='object')?deepCopy(def.settings[k]):def.settings[k]; }
+  if(!out.character_costume_categories) out.character_costume_categories={};
+  const cc=out.costume_categories||{};
+  if(cc && typeof cc==='object' && cc.Character && typeof cc.Character==='object' && !Array.isArray(cc.Character)){
+    for(const ch in cc.Character){ const lst=cc.Character[ch]; if(!Array.isArray(lst)) continue;
+      const uniq=[], seen=new Set();
+      for(const key of lst){ if((key in (out.costumes||{})) && !seen.has(key)){ uniq.push(key); seen.add(key); } }
+      out.character_costume_categories[ch]=out.character_costume_categories[ch]||{};
+      const merged=(out.character_costume_categories[ch].Default||[]).slice();
+      for(const k of uniq){ if(!merged.includes(k)) merged.push(k); }
+      out.character_costume_categories[ch].Default=merged;
+    }
+    try{ delete out.costume_categories.Character; }catch(e){}
+  }
+  return out;
+}
+function mergeListUnique(base, add){ if(!Array.isArray(base)) base=[]; const seen=new Set(base), out=base.slice();
+  for(const x of (add||[])){ if(!seen.has(x)){ out.push(x); seen.add(x); } } return out; }
+function looksLikeSongsMap(d){ if(!d||typeof d!=='object'||Array.isArray(d)) return false;
+  let cnt=0,hit=0; for(const v of Object.values(d).slice(0,10)){ cnt++; if(v&&typeof v==='object'&&('japanese'in v||'korean'in v||'english'in v)) hit++; }
+  return cnt>0 && hit/cnt>=0.6; }
+function mergeNonDestructive(dst, src){
+  const stats={songs_added:0,groups_added:0,characters_added:0,costumes_added:0,mods_added:0,
+    song_cat_updates:0,costume_cat_updates:0,char_costume_cat_updates:0,settings_filled:0};
+  for(const [sec,ks] of [['songs','songs_added'],['groups','groups_added'],['characters','characters_added'],['costumes','costumes_added'],['mods','mods_added']]){
+    dst[sec]=dst[sec]||{}; const s=src[sec]||{};
+    for(const k in s){ if(!(k in dst[sec])){ dst[sec][k]=s[k]; stats[ks]++; }
+      else if(dst[sec][k]&&typeof dst[sec][k]==='object'&&s[k]&&typeof s[k]==='object'){ for(const sk in s[k]){ if(!(sk in dst[sec][k])) dst[sec][k][sk]=s[k][sk]; } } }
+  }
+  dst.song_categories=dst.song_categories||{};
+  for(const cat in (src.song_categories||{})){ const b=(dst.song_categories[cat]||[]).length;
+    dst.song_categories[cat]=mergeListUnique(dst.song_categories[cat]||[], src.song_categories[cat]); stats.song_cat_updates+=Math.max(0,dst.song_categories[cat].length-b); }
+  dst.costume_categories=dst.costume_categories||{};
+  for(const cat in (src.costume_categories||{})){ const b=(dst.costume_categories[cat]||[]).length;
+    dst.costume_categories[cat]=mergeListUnique(dst.costume_categories[cat]||[], src.costume_categories[cat]); stats.costume_cat_updates+=Math.max(0,dst.costume_categories[cat].length-b); }
+  dst.character_costume_categories=dst.character_costume_categories||{};
+  const sccc=src.character_costume_categories||{};
+  for(const ch in sccc){ dst.character_costume_categories[ch]=dst.character_costume_categories[ch]||{};
+    for(const cat in (sccc[ch]||{})){ const b=(dst.character_costume_categories[ch][cat]||[]).length;
+      dst.character_costume_categories[ch][cat]=mergeListUnique(dst.character_costume_categories[ch][cat]||[], sccc[ch][cat]);
+      stats.char_costume_cat_updates+=Math.max(0,dst.character_costume_categories[ch][cat].length-b); } }
+  dst.settings=dst.settings||{};
+  for(const k in (src.settings||{})){ if(!(k in dst.settings)){ dst.settings[k]=src.settings[k]; stats.settings_filled++; } }
+  return stats;
+}
+function registerPWA(){
+  try{
+    const icon="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235865f2'/%3E%3Ctext y='.92em' x='6' font-size='74'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E";
+    const mani={name:"YouTube 설명 생성기",short_name:"YT설명",display:"standalone",
+      background_color:"#1e1f22",theme_color:"#1e1f22",start_url:".",
+      icons:[{src:icon,sizes:"any",type:"image/svg+xml"}]};
+    const l=document.createElement('link'); l.rel='manifest';
+    l.href=URL.createObjectURL(new Blob([JSON.stringify(mani)],{type:'application/manifest+json'}));
+    document.head.appendChild(l);
+  }catch(e){}
+}
+
+// ---------------- generation (mirror of Python generate_description) --------
+function pick(d,lng,fb){ return (d && Object.prototype.hasOwnProperty.call(d,lng)) ? d[lng] : fb; }
+function replaceAllStr(s,a,b){ return s.split(a).join(b); }
+function pyFormat(fmt,mp){
+  let out='', i=0; const n=fmt.length;
+  while(i<n){
+    const c=fmt[i];
+    if(c==='{'){
+      if(fmt[i+1]==='{'){ out+='{'; i+=2; continue; }
+      const j=fmt.indexOf('}', i+1);
+      if(j<0) throw new Error("single '{'");
+      let name=fmt.slice(i+1,j).split(':')[0].split('!')[0];
+      if(!Object.prototype.hasOwnProperty.call(mp,name)) throw new Error('KeyError '+name);
+      const v=mp[name]; out+=(v==null?'':String(v)); i=j+1;
+    } else if(c==='}'){
+      if(fmt[i+1]==='}'){ out+='}'; i+=2; continue; }
+      throw new Error("single '}'");
+    } else { out+=c; i++; }
+  }
+  return out;
+}
+function generate(){
+  if(!DATA){ return; }
+  const st=DATA.settings||{};
+  const languages=st.languages||['japanese','korean','english'];
+  const at=S.atype, ak=S.artist||'', sk=S.song||'';
+  const sd=(DATA.songs||{})[sk]||{};
+  const ck=S.costume||''; const cd=(DATA.costumes||{})[ck]||{};
+  const ar=S.ratio||''; const tp=S.vtype||'MOD';
+  const ms=S.mods.slice();
+  const cpl=((cd.costume_playlist||'')+'').trim();
+  let playlist_line='', artistStr, extra_ht='';
+
+  if(at==='characters'){
+    let sels=S.solos.slice(); if(!sels.length && ak) sels=[ak];
+    const chars=DATA.characters||{};
+    const ad_list=sels.filter(k=>k in chars).map(k=>chars[k]);
+    const multiple=ad_list.length>=2;
+    const apls=ad_list.map(ad=>((ad.artist_playlist||'')+'').trim());
+    const apl=multiple?'':(apls.length?apls[0]:'');
+    if(apl&&cpl) playlist_line=sels[0]+' playlist : '+apl+' | Costume playlist : '+cpl;
+    else if(cpl) playlist_line='Costume playlist : '+cpl;
+    else if(apl) playlist_line=sels[0]+' playlist : '+apl;
+    artistStr=lng=>sels.map(k=>pick(chars[k]||{},lng,k)).join(', ');
+    extra_ht=ad_list.filter(ad=>ad.hashtags).map(ad=>ad.hashtags).join(' ');
+  } else {
+    const ad=(DATA.groups||{})[ak]||{};
+    const apl=((ad.artist_playlist||'')+'').trim();
+    if(apl&&cpl) playlist_line=ak+' playlist : '+apl+' | Costume playlist : '+cpl;
+    else if(cpl) playlist_line='Costume playlist : '+cpl;
+    else if(apl) playlist_line=ak+' playlist : '+apl;
+    artistStr=lng=>pick(ad,lng,ak);
+    extra_ht=ad.hashtags||'';
+  }
+
+  const mods=DATA.mods||{};
+  const modStr=lng=>{
+    const arr=[];
+    for(const m of ms){ const md=mods[m]; if(!md) continue;
+      const nm=pick(md,lng,m);
+      if(md.has_value){ const v=md.default_value||''; arr.push(v?(nm+'('+v+')'):nm); }
+      else arr.push(nm);
+    }
+    return arr.join(', ');
+  };
+  const cosStr=lng=>{ const nm=(cd[lng]||''); if(!nm) return '';
+    if(lng==='japanese') return nm+'衣装'; if(lng==='korean') return nm+' 의상'; return nm+' Costume'; };
+
+  let ht='#スクスタ #SIFAS #스쿠스타 #lovelive #ラブライブ';
+  if(tp==='MOD') ht+=' #MOD'; if(extra_ht) ht+=' '+extra_ht;
+
+  const vmap={playlist:playlist_line, hashtags:ht};
+  for(const lng of languages){
+    const fmt=st[lng+'_format']||'';
+    const mp={song:pick(sd,lng,sk), artist:artistStr(lng), mod:modStr(lng),
+              costume:cosStr(lng), ratio: ar?('['+ar+']'):'', type:tp};
+    let line;
+    try{
+      line=pyFormat(fmt,mp);
+      for(let p=0;p<6;p++){ const b=line;
+        line=replaceAllStr(line,'(, ','('); line=replaceAllStr(line,', )',')');
+        line=replaceAllStr(line,'()',''); line=replaceAllStr(line,', ,',','); line=line.trim();
+        if(line===b) break; }
+    }catch(e){ line='Format Error'; }
+    vmap[lng]=line;
+  }
+  const order=st.format_order||[];
+  const lines=[];
+  for(const item of order){ const key=item.replace(/^[{}]+|[{}]+$/g,''); if(vmap[key]) lines.push(vmap[key]); }
+  el('preview').textContent=lines.join('\n');
+}
+
+// ---------------- select helpers ----------------
+function fillSelect(sel, items, current){
+  sel.innerHTML='';
+  for(const it of items){ const o=document.createElement('option'); o.value=it; o.textContent=it; sel.appendChild(o); }
+  if(current && items.includes(current)) sel.value=current;
+  else if(items.length) sel.value=items[0];
+  else sel.value='';
+  return sel.value;
+}
+
+// ---------------- costume filtering (mirror of Qt) ----------------
+function whitelistAllowed(k){
+  const s=DATA.settings||{};
+  if(!s.enable_costume_category_filter) return true;
+  const wl=(s.costume_category_whitelist||[]).map(x=>(''+x).trim()).filter(Boolean);
+  if(!wl.length) return true;
+  const cc=DATA.costume_categories||{};
+  for(const cat of wl){ const arr=cc[cat]; if(Array.isArray(arr)&&arr.includes(k)) return true; }
+  return false;
+}
+function costumeItems(){
+  let keys=Object.keys(DATA.costumes||{});
+  const cat=S.costumeCat;
+  if(cat && cat!=='All'){ const pool=(DATA.costume_categories||{})[cat]||[]; keys=pool.filter(k=>k in (DATA.costumes||{})); }
+  return keys.filter(whitelistAllowed);
+}
+function songItems(){
+  let keys=Object.keys(DATA.songs||{});
+  const cat=S.songCat;
+  if(cat && cat!=='All'){ const pool=(DATA.song_categories||{})[cat]||[]; keys=pool.filter(k=>k in (DATA.songs||{})); }
+  return keys;
+}
+
+// ---------------- renderers ----------------
+function renderArtist(){
+  const items=Object.keys(DATA[S.atype]||{});
+  S.artist=fillSelect(el('artist'), items, S.artist);
+  const isChar=S.atype==='characters';
+  el('soloBox').classList.toggle('hidden', !isChar);
+  el('soloAddRow').classList.toggle('hidden', !isChar);
+  el('charcosCard').classList.toggle('hidden', !isChar);
+}
+function renderSongCat(){
+  const cats=['All',...Object.keys(DATA.song_categories||{})];
+  S.songCat=fillSelect(el('songCat'), cats, S.songCat);
+}
+function renderSong(){ S.song=fillSelect(el('song'), songItems(), S.song); }
+function renderCostumeCat(){
+  const cats=['All',...Object.keys(DATA.costume_categories||{})];
+  S.costumeCat=fillSelect(el('costumeCat'), cats, S.costumeCat);
+}
+function renderCostume(){ S.costume=fillSelect(el('costume'), costumeItems(), S.costume); }
+function renderRatios(){ S.ratio=fillSelect(el('ratio'), DATA.settings.aspect_ratios||[], S.ratio); }
+
+function renderSolos(){
+  const box=el('soloList'); box.innerHTML='';
+  if(!S.solos.length){ box.className='list empty'; box.textContent='(비어 있음) — 캐릭터 여러 명을 Solo로 추가'; return; }
+  box.className='list';
+  S.solos.forEach((k,idx)=>{
+    const d=document.createElement('div'); d.className='it'; d.textContent=k;
+    d.onclick=()=>{ d.classList.toggle('sel'); };
+    box.appendChild(d);
+  });
+}
+function renderMods(){
+  const box=el('modList'); const keys=Object.keys(DATA.mods||{});
+  box.innerHTML='';
+  if(!keys.length){ box.className='list empty'; box.textContent='(mods 없음)'; return; }
+  box.className='list';
+  S.mods=S.mods.filter(m=>keys.includes(m));
+  keys.forEach(k=>{
+    const d=document.createElement('div'); d.className='it';
+    const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=S.mods.includes(k);
+    cb.onclick=(e)=>{ e.stopPropagation(); toggleMod(k,cb.checked); };
+    const sp=document.createElement('span'); sp.textContent=k;
+    const md=DATA.mods[k]; if(md&&md.has_value){ const t=document.createElement('span'); t.className='tag'; t.textContent='(value)'; sp.appendChild(document.createTextNode(' ')); sp.appendChild(t); }
+    d.appendChild(cb); d.appendChild(sp);
+    d.onclick=()=>{ cb.checked=!cb.checked; toggleMod(k,cb.checked); };
+    box.appendChild(d);
+  });
+}
+function toggleMod(k,on){
+  const i=S.mods.indexOf(k);
+  if(on && i<0) S.mods.push(k);
+  if(!on && i>=0) S.mods.splice(i,1);
+  generate();
+}
+function renderFilter(){
+  el('cfEnable').checked=!!DATA.settings.enable_costume_category_filter;
+  const wl=new Set(DATA.settings.costume_category_whitelist||[]);
+  const box=el('cfList'); box.innerHTML=''; box.className='list';
+  const cats=Object.keys(DATA.costume_categories||{});
+  if(!cats.length){ box.className='list empty'; box.textContent='(카테고리 없음)'; return; }
+  cats.forEach(c=>{
+    const d=document.createElement('div'); d.className='it';
+    const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=wl.has(c); cb.dataset.cat=c;
+    cb.onclick=(e)=>e.stopPropagation();
+    cb.onchange=onFilterChange;
+    const sp=document.createElement('span'); sp.textContent=c;
+    d.appendChild(cb); d.appendChild(sp);
+    d.onclick=()=>{ cb.checked=!cb.checked; onFilterChange(); };
+    box.appendChild(d);
+  });
+}
+function onFilterChange(){
+  DATA.settings.enable_costume_category_filter=el('cfEnable').checked;
+  const wl=[];
+  el('cfList').querySelectorAll('input[type=checkbox]').forEach(cb=>{ if(cb.checked) wl.push(cb.dataset.cat); });
+  DATA.settings.costume_category_whitelist=wl;
+  renderCostume(); renderCharcos(); generate(); markDirty();
+}
+function renderOrder(){
+  const box=el('orderList'); box.innerHTML=''; box.className='list';
+  (DATA.settings.format_order||[]).forEach((it,idx)=>{
+    const d=document.createElement('div'); d.className='it'+(idx===orderSel?' sel':''); d.textContent=it;
+    d.onclick=()=>{ orderSel=idx; renderOrder(); };
+    box.appendChild(d);
+  });
+}
+let orderSel=-1;
+function orderMove(dir){
+  const arr=DATA.settings.format_order||[];
+  const i=orderSel; if(i<0) return;
+  const j=i+dir; if(j<0||j>=arr.length) return;
+  [arr[i],arr[j]]=[arr[j],arr[i]]; orderSel=j;
+  renderOrder(); generate(); markDirty();
+}
+function renderFormats(){
+  const box=el('fmtBox'); box.innerHTML='';
+  (DATA.settings.languages||[]).forEach(lng=>{
+    const lab=document.createElement('label'); lab.textContent=lng; box.appendChild(lab);
+    const inp=document.createElement('input'); inp.type='text'; inp.value=DATA.settings[lng+'_format']||'';
+    inp.oninput=()=>{ DATA.settings[lng+'_format']=inp.value; generate(); markDirty(); };
+    box.appendChild(inp);
+  });
+}
+
+// ---------------- CharacterCostume ----------------
+function ensureCharcos(ak){
+  DATA.character_costume_categories=DATA.character_costume_categories||{};
+  const cc=DATA.character_costume_categories[ak]||(DATA.character_costume_categories[ak]={});
+  if(!Object.keys(cc).length) cc.Default=[];
+  return cc;
+}
+function renderCharcos(){
+  if(S.atype!=='characters' || !S.artist){ el('ccCat').innerHTML=''; el('ccList').innerHTML=''; el('ccAdd').innerHTML=''; el('charcosWho').textContent=''; return; }
+  el('charcosWho').textContent='캐릭터: '+S.artist;
+  const cc=ensureCharcos(S.artist);
+  const cats=Object.keys(cc);
+  S.ccCat=fillSelect(el('ccCat'), cats, S.ccCat);
+  const cat=S.ccCat||'Default';
+  const lst=cc[cat]||[];
+  // list
+  const box=el('ccList'); box.innerHTML='';
+  if(!lst.length){ box.className='list empty'; box.textContent='(비어 있음)'; }
+  else{
+    box.className='list';
+    lst.forEach(k=>{
+      const d=document.createElement('div'); d.className='it'+(ccSel===k?' sel':''); d.textContent=k;
+      d.onclick=()=>{ ccSel=k; setCostumeFromCharcos(k); renderCharcos(); };
+      box.appendChild(d);
+    });
+  }
+  // candidates
+  const cand=Object.keys(DATA.costumes||{}).filter(k=>!lst.includes(k) && whitelistAllowed(k));
+  fillSelect(el('ccAdd'), cand, el('ccAdd').value);
+}
+let ccSel="";
+function setCostumeFromCharcos(k){
+  // Wire the (previously dead) CharacterCostume selection to the global Costume.
+  if(!(k in (DATA.costumes||{}))) return;
+  S.costume=k; S.costumeCat='All';
+  renderCostumeCat(); renderCostume(); generate();
+}
+function ccCatAdd(){
+  openForm('새 카테고리',[{key:'name',label:'카테고리 이름',type:'text'}],{},(v)=>{
+    const name=(v.name||'').trim(); if(!name) return;
+    const cc=ensureCharcos(S.artist); if(name in cc){ toast('이미 있음'); return; }
+    cc[name]=[]; S.ccCat=name; renderCharcos(); markDirty();
+  });
+}
+function ccCatRename(){
+  const old=S.ccCat; if(!old) return;
+  openForm('카테고리 이름 변경',[{key:'name',label:'새 이름',type:'text'}],{name:old},(v)=>{
+    const name=(v.name||'').trim(); if(!name||name===old) return;
+    const cc=ensureCharcos(S.artist); if(name in cc){ toast('이미 있음'); return; }
+    cc[name]=cc[old]; delete cc[old]; S.ccCat=name; renderCharcos(); markDirty();
+  });
+}
+function ccCatDel(){
+  const cat=S.ccCat; if(!cat) return;
+  if(!confirm('카테고리 삭제: '+cat+' ?')) return;
+  const cc=ensureCharcos(S.artist); delete cc[cat];
+  if(!Object.keys(cc).length) cc.Default=[];
+  S.ccCat=''; renderCharcos(); markDirty();
+}
+function ccAddToCat(){
+  const cat=S.ccCat||'Default'; const key=el('ccAdd').value.trim(); if(!key) return;
+  const cc=ensureCharcos(S.artist); const lst=cc[cat]||(cc[cat]=[]);
+  if(!lst.includes(key)) lst.push(key);
+  renderCharcos(); markDirty();
+}
+function ccRemoveFromCat(){
+  const cat=S.ccCat||'Default'; if(!ccSel) return;
+  const cc=ensureCharcos(S.artist); const lst=cc[cat]||[];
+  const i=lst.indexOf(ccSel); if(i>=0) lst.splice(i,1);
+  ccSel=''; renderCharcos(); markDirty();
+}
+
+// ---------------- Solos ----------------
+function soloAdd(){
+  if(S.atype!=='characters') return;
+  const k=S.artist; if(!k) return;
+  if(!S.solos.includes(k)) S.solos.push(k);
+  renderSolos(); generate();
+}
+function soloDel(){
+  const keep=[];
+  el('soloList').querySelectorAll('.it').forEach((d,i)=>{ if(!d.classList.contains('sel')) keep.push(S.solos[i]); });
+  S.solos=keep; renderSolos(); generate();
+}
+function soloClear(){ S.solos=[]; renderSolos(); generate(); }
+
+// ---------------- selection change handlers ----------------
+function onAtype(){ S.atype=el('atype').value; S.artist=''; renderArtist(); renderCharcos(); generate(); }
+function onArtist(){ S.artist=el('artist').value; renderCharcos(); generate(); }
+function onSongCat(){ S.songCat=el('songCat').value; renderSong(); generate(); }
+function onSong(){ S.song=el('song').value; generate(); }
+function onCostumeCat(){ S.costumeCat=el('costumeCat').value; renderCostume(); generate(); }
+function onCostume(){ S.costume=el('costume').value; generate(); }
+function noCostume(){ S.costume=''; el('costume').value=''; generate(); }
+function onRatio(){ S.ratio=el('ratio').value; generate(); }
+function onVtype(){ S.vtype=el('vtype').value; generate(); }
+
+// ---------------- ratios editor ----------------
+function editRatios(){
+  const cur=(DATA.settings.aspect_ratios||[]).join(', ');
+  openForm('Aspect Ratios 편집',[{key:'r',label:'쉼표로 구분',type:'text'}],{r:cur},(v)=>{
+    DATA.settings.aspect_ratios=(v.r||'').split(',').map(s=>s.trim()).filter(Boolean);
+    renderRatios(); generate(); markDirty();
+  });
+}
+
+// ---------------- CRUD: artist / song / costume / mod ----------------
+function reassignCategory(mapObj, key, cat){
+  // remove key from every list in mapObj, then add to cat's list
+  for(const c of Object.keys(mapObj)){ if(Array.isArray(mapObj[c])){ const i=mapObj[c].indexOf(key); if(i>=0) mapObj[c].splice(i,1); } }
+  if(cat && cat!=='(변경 안 함)'){ (mapObj[cat]=mapObj[cat]||[]).push(key); }
+}
+function currentCategoryOf(mapObj, key){
+  for(const c of Object.keys(mapObj)){ if(Array.isArray(mapObj[c])&&mapObj[c].includes(key)) return c; }
+  return '';
+}
+
+function crudArtist(op){
+  const store=DATA[S.atype]; const isChar=S.atype==='characters';
+  if(op==='del'){
+    const k=S.artist; if(!k) return; if(!confirm('삭제: '+k+' ?')) return;
+    delete store[k];
+    if(isChar){ S.solos=S.solos.filter(x=>x!==k); delete (DATA.character_costume_categories||{})[k]; }
+    S.artist=''; renderArtist(); renderCharcos(); renderSolos(); generate(); markDirty(); return;
+  }
+  const editing=op==='edit'; const k0=editing?S.artist:''; if(editing && !k0) return;
+  const cur=editing?(store[k0]||{}):{};
+  const fields=[];
+  if(!editing) fields.push({key:'__key',label:'Key (고유 이름)',type:'text'});
+  fields.push({key:'japanese',label:'japanese',type:'text'});
+  fields.push({key:'korean',label:'korean',type:'text'});
+  fields.push({key:'english',label:'english',type:'text'});
+  fields.push({key:'artist_playlist',label:'Artist Playlist (URL)',type:'text'});
+  fields.push({key:'hashtags',label:'Hashtags',type:'text'});
+  const init=editing?Object.assign({},cur):{};
+  openForm((editing?'편집: ':'추가: ')+(S.atype), fields, init, (v)=>{
+    const key=editing?k0:(v.__key||'').trim(); if(!key) return;
+    if(!editing && (key in store)){ toast('이미 있음'); return; }
+    store[key]={japanese:v.japanese||'',korean:v.korean||'',english:v.english||'',
+                artist_playlist:v.artist_playlist||'',hashtags:v.hashtags||''};
+    S.artist=key; renderArtist(); renderCharcos(); generate(); markDirty();
+  });
+}
+
+function crudSong(op){
+  const store=DATA.songs; const cats=DATA.song_categories;
+  if(op==='del'){
+    const k=S.song; if(!k) return; if(!confirm('삭제: '+k+' ?')) return;
+    delete store[k];
+    for(const c of Object.keys(cats)){ const i=cats[c].indexOf(k); if(i>=0) cats[c].splice(i,1); }
+    S.song=''; renderSong(); generate(); markDirty(); return;
+  }
+  const editing=op==='edit'; const k0=editing?S.song:''; if(editing && !k0) return;
+  const cur=editing?(store[k0]||{}):{};
+  const catOpts=['(변경 안 함)',...Object.keys(cats)];
+  const fields=[];
+  if(!editing) fields.push({key:'__key',label:'Key (고유 이름)',type:'text'});
+  fields.push({key:'japanese',label:'japanese',type:'text'});
+  fields.push({key:'korean',label:'korean',type:'text'});
+  fields.push({key:'english',label:'english',type:'text'});
+  fields.push({key:'__cat',label:'Category',type:'select',options:catOpts});
+  const init=editing?Object.assign({__cat:currentCategoryOf(cats,k0)||'(변경 안 함)'},cur):{__cat:'(변경 안 함)'};
+  openForm((editing?'편집: ':'추가: ')+'Song', fields, init, (v)=>{
+    const key=editing?k0:(v.__key||'').trim(); if(!key) return;
+    if(!editing && (key in store)){ toast('이미 있음'); return; }
+    store[key]={japanese:v.japanese||'',korean:v.korean||'',english:v.english||''};
+    if(v.__cat && v.__cat!=='(변경 안 함)') reassignCategory(cats,key,v.__cat);
+    S.song=key; renderSongCat(); renderSong(); generate(); markDirty();
+  });
+}
+
+function crudCostume(op){
+  const store=DATA.costumes; const cats=DATA.costume_categories;
+  if(op==='del'){
+    const k=S.costume; if(!k) return; if(!confirm('삭제: '+k+' ?')) return;
+    delete store[k];
+    for(const c of Object.keys(cats)){ if(Array.isArray(cats[c])){ const i=cats[c].indexOf(k); if(i>=0) cats[c].splice(i,1); } }
+    // also purge from every character_costume_categories list
+    const ccc=DATA.character_costume_categories||{};
+    for(const ch of Object.keys(ccc)){ for(const cc of Object.keys(ccc[ch]||{})){ const arr=ccc[ch][cc]; if(Array.isArray(arr)){ const i=arr.indexOf(k); if(i>=0) arr.splice(i,1); } } }
+    S.costume=''; renderCostume(); renderCharcos(); generate(); markDirty(); return;
+  }
+  const editing=op==='edit'; const k0=editing?S.costume:''; if(editing && !k0) return;
+  const cur=editing?(store[k0]||{}):{};
+  const catOpts=['(변경 안 함)',...Object.keys(cats)];
+  const fields=[];
+  if(!editing) fields.push({key:'__key',label:'Key (고유 이름)',type:'text'});
+  fields.push({key:'japanese',label:'japanese',type:'text'});
+  fields.push({key:'korean',label:'korean',type:'text'});
+  fields.push({key:'english',label:'english',type:'text'});
+  fields.push({key:'costume_playlist',label:'Costume Playlist (URL)',type:'text'});
+  fields.push({key:'__cat',label:'Category',type:'select',options:catOpts});
+  const init=editing?Object.assign({__cat:currentCategoryOf(cats,k0)||'(변경 안 함)'},cur):{__cat:'(변경 안 함)'};
+  openForm((editing?'편집: ':'추가: ')+'Costume', fields, init, (v)=>{
+    const key=editing?k0:(v.__key||'').trim(); if(!key) return;
+    if(!editing && (key in store)){ toast('이미 있음'); return; }
+    store[key]={japanese:v.japanese||'',korean:v.korean||'',english:v.english||'',costume_playlist:v.costume_playlist||''};
+    if(v.__cat && v.__cat!=='(변경 안 함)') reassignCategory(cats,key,v.__cat);
+    S.costume=key; renderCostumeCat(); renderCostume(); generate(); markDirty();
+  });
+}
+
+function crudMod(op){
+  const store=DATA.mods;
+  if(op!=='add'){
+    if(!S.mods.length){ toast('먼저 mod를 체크하세요'); return; }
+  }
+  if(op==='del'){
+    const k=S.mods[S.mods.length-1]; if(!confirm('삭제: '+k+' ?')) return;
+    delete store[k]; S.mods=S.mods.filter(x=>x!==k); renderMods(); generate(); markDirty(); return;
+  }
+  const editing=op==='edit'; const k0=editing?S.mods[S.mods.length-1]:'';
+  const cur=editing?(store[k0]||{}):{};
+  const fields=[];
+  if(!editing) fields.push({key:'__key',label:'Key (고유 이름)',type:'text'});
+  fields.push({key:'japanese',label:'japanese',type:'text'});
+  fields.push({key:'korean',label:'korean',type:'text'});
+  fields.push({key:'english',label:'english',type:'text'});
+  fields.push({key:'has_value',label:'값(value) 필드 사용',type:'checkbox'});
+  fields.push({key:'default_value',label:'기본 값',type:'text'});
+  const init=editing?Object.assign({},cur):{has_value:false};
+  openForm((editing?'편집: ':'추가: ')+'Mod', fields, init, (v)=>{
+    const key=editing?k0:(v.__key||'').trim(); if(!key) return;
+    if(!editing && (key in store)){ toast('이미 있음'); return; }
+    const mi={japanese:v.japanese||'',korean:v.korean||'',english:v.english||'',has_value:!!v.has_value};
+    if(mi.has_value) mi.default_value=v.default_value||'';
+    store[key]=mi; renderMods(); generate(); markDirty();
+  });
+}
+
+// ---------------- generic modal form ----------------
+function openForm(title, fields, init, onOk){
+  const bg=document.createElement('div'); bg.className='modal-bg';
+  const m=document.createElement('div'); m.className='modal';
+  const h=document.createElement('h3'); h.textContent=title; m.appendChild(h);
+  const inputs={};
+  fields.forEach(f=>{
+    const lab=document.createElement('label'); lab.textContent=f.label; m.appendChild(lab);
+    if(f.type==='select'){
+      const s=document.createElement('select'); (f.options||[]).forEach(o=>{ const op=document.createElement('option'); op.value=o; op.textContent=o; s.appendChild(op); });
+      s.value=(init&&init[f.key]!=null)?init[f.key]:(f.options&&f.options[0]); inputs[f.key]=()=>s.value; m.appendChild(s);
+    } else if(f.type==='checkbox'){
+      const wrap=document.createElement('label'); wrap.className='chk';
+      const c=document.createElement('input'); c.type='checkbox'; c.checked=!!(init&&init[f.key]);
+      wrap.appendChild(c); wrap.appendChild(document.createTextNode(' '+f.label));
+      lab.remove(); m.appendChild(wrap); inputs[f.key]=()=>c.checked;
+    } else {
+      const i=document.createElement('input'); i.type='text'; i.value=(init&&init[f.key]!=null)?init[f.key]:''; inputs[f.key]=()=>i.value; m.appendChild(i);
+    }
+  });
+  const btns=document.createElement('div'); btns.className='btns';
+  const cancel=document.createElement('button'); cancel.textContent='취소'; cancel.onclick=close;
+  const ok=document.createElement('button'); ok.className='primary'; ok.textContent='확인';
+  ok.onclick=()=>{ const out={}; for(const k in inputs) out[k]=inputs[k](); close(); onOk(out); };
+  btns.appendChild(cancel); btns.appendChild(ok); m.appendChild(btns);
+  bg.appendChild(m); el('modalRoot').appendChild(bg);
+  bg.onclick=(e)=>{ if(e.target===bg) close(); };
+  const first=m.querySelector('input,select'); if(first) first.focus();
+  m.addEventListener('keydown',(e)=>{ if(e.key==='Enter'&&e.target.tagName!=='SELECT'){ ok.click(); } if(e.key==='Escape') close(); });
+  function close(){ bg.remove(); }
+}
+
+// ---------------- import ----------------
+function openImport(){
+  const bg=document.createElement('div'); bg.className='modal-bg';
+  const m=document.createElement('div'); m.className='modal'; m.style.maxWidth='620px';
+  m.innerHTML='<h3>Import JSON values (비파괴 병합)</h3>'+
+    '<div class="hint" style="margin-top:0">{"songs":{...}} 형태 전체, 또는 곧바로 songs 딕셔너리를 붙여넣으세요. 기존 값은 덮어쓰지 않습니다.</div>';
+  const ta=document.createElement('textarea'); ta.placeholder='{ "songs": { "Song Name": {"japanese":"...","korean":"...","english":"..."} } }'; m.appendChild(ta);
+  const btns=document.createElement('div'); btns.className='btns';
+  const cancel=document.createElement('button'); cancel.textContent='취소'; cancel.onclick=()=>bg.remove();
+  const imp=document.createElement('button'); imp.className='primary'; imp.textContent='Import';
+  imp.onclick=async()=>{
+    const text=ta.value.trim(); if(!text){ toast('내용이 없습니다'); return; }
+    imp.disabled=true; imp.textContent='병합 중…';
+    if(MODE==='static'){
+      try{
+        const obj=JSON.parse(text);
+        let src=(obj && typeof obj==='object' && !('songs' in obj) && looksLikeSongsMap(obj)) ? {songs:obj} : obj;
+        src=normalizeData(src);
+        const st=mergeNonDestructive(DATA, src);
+        const added=st.songs_added+st.groups_added+st.characters_added+st.costumes_added+st.mods_added;
+        saveNow(); renderAll(); bg.remove(); toast('Import 완료: 항목 +'+added);
+      }catch(e){ imp.disabled=false; imp.textContent='Import'; toast('Import 실패: '+e); }
+      return;
+    }
+    const j=await apiPost('/api/import',{text});
+    if(j.ok){ DATA=j.data; renderAll(); bg.remove(); toast('Import 완료: '+(j.summary||'')); setStatus('저장됨 ✓','ok'); }
+    else { imp.disabled=false; imp.textContent='Import'; toast('Import 실패: '+(j.error||'')); }
+  };
+  btns.appendChild(cancel); btns.appendChild(imp); m.appendChild(btns);
+  bg.appendChild(m); el('modalRoot').appendChild(bg);
+  bg.onclick=(e)=>{ if(e.target===bg) bg.remove(); };
+  ta.focus();
+}
+
+// ---------------- copy ----------------
+function copyOut(){
+  const txt=el('preview').textContent||''; if(!txt){ toast('내용 없음'); return; }
+  let ok=false;
+  try{ const t=document.createElement('textarea'); t.value=txt; t.style.position='fixed'; t.style.opacity='0'; document.body.appendChild(t); t.focus(); t.select(); ok=document.execCommand('copy'); document.body.removeChild(t); }catch(e){}
+  if(navigator.clipboard){ navigator.clipboard.writeText(txt).then(()=>{},()=>{}); ok=true; }
+  toast(ok?'복사됨 ✓':'복사 실패 — 직접 선택하세요');
+}
+
+// ---------------- boot ----------------
+function renderAll(){
+  el('atype').value=S.atype;
+  el('vtype').value=S.vtype;
+  renderArtist(); renderSongCat(); renderSong(); renderCostumeCat(); renderCostume();
+  renderRatios(); renderSolos(); renderMods(); renderFilter(); renderOrder(); renderFormats(); renderCharcos();
+  generate();
+}
+function afterLoad(note){
+  if(DATA.settings && DATA.settings.aspect_ratios && DATA.settings.aspect_ratios.length) S.ratio=DATA.settings.aspect_ratios[0];
+  const badge=el('modeBadge'); if(badge) badge.textContent = (MODE==='static') ? '💾 브라우저 저장' : '🖥 로컬 서버';
+  renderAll();
+  setStatus('불러옴 ✓ '+(note||''),'ok');
+  registerPWA();
+}
+async function boot(){
+  // Static when a seed is baked in (built index.html) or when no server is reachable.
+  if(typeof window.__SEED__ !== 'undefined' || window.__STATIC__){
+    MODE='static';
+    let saved=null; try{ saved=localStorage.getItem(LS_KEY); }catch(e){}
+    DATA=normalizeData(saved ? JSON.parse(saved) : (window.__SEED__||{}));
+    afterLoad('정적 모드');
+    return;
+  }
+  try{
+    const j=await apiGet('/api/data');
+    MODE='server'; DATA=j.data;
+    afterLoad(j.path?('('+j.path.split(/[\\/]/).pop()+')'):'');
+  }catch(e){
+    MODE='static';
+    let saved=null; try{ saved=localStorage.getItem(LS_KEY); }catch(_){}
+    DATA=normalizeData(saved ? JSON.parse(saved) : {});
+    afterLoad('정적 모드');
+  }
+}
+window.addEventListener('beforeunload',()=>{
+  if(MODE==='server' && saveTimer){ try{ navigator.sendBeacon('/api/save', new Blob([JSON.stringify({data:DATA})],{type:'application/json'})); }catch(e){} }
+});
+boot();
+</script></body></html>"""
+
+
+# ==========================================================================
+# Standalone app window (pywebview) + browser fallbacks (from sifas_fbx.py)
+# ==========================================================================
+def _pip(pkg):
+    import subprocess
+    for extra in (["--break-system-packages", "-q"], ["-q"]):
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", pkg] + extra, check=True)
+            return True
         except Exception:
             pass
+    return False
 
-    # 2) shift: i -> i+1
-    for i in range(max_backups - 1, 0, -1):
-        src = p.with_name(f"{p.stem}_{i}.json")
-        dst = p.with_name(f"{p.stem}_{i+1}.json")
-        if src.exists():
+
+def _open_browser_window(url, width=1180, height=860):
+    """Open `url` in a separate, sized window: a Chromium '--app' window if such a
+    browser exists; else on macOS a new Safari window via AppleScript; else the
+    default browser in a new window."""
+    import subprocess
+    import webbrowser
+    cands = []
+    if sys.platform == "darwin":
+        cands = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                 "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                 "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                 "/Applications/Chromium.app/Contents/MacOS/Chromium"]
+    elif sys.platform.startswith("win"):
+        for base in (os.environ.get("PROGRAMFILES", ""), os.environ.get("PROGRAMFILES(X86)", ""),
+                     os.environ.get("LOCALAPPDATA", "")):
+            if base:
+                cands += [os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"),
+                          os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"),
+                          os.path.join(base, "BraveSoftware", "Brave-Browser", "Application", "brave.exe")]
+    else:
+        for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+                     "microsoft-edge", "brave-browser"):
+            p = shutil.which(name)
+            if p:
+                cands.append(p)
+    exe = next((c for c in cands if c and os.path.isfile(c)), None)
+    if exe:
+        try:
+            subprocess.Popen([exe, "--app=" + url, "--window-size=%d,%d" % (width, height)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except Exception:
+            pass
+    if sys.platform == "darwin":
+        x, y = 120, 60
+        script = ('tell application "Safari"\n'
+                  '  activate\n'
+                  '  make new document with properties {URL:"%s"}\n'
+                  '  delay 0.3\n  try\n'
+                  '    set bounds of front window to {%d, %d, %d, %d}\n'
+                  '  end try\nend tell') % (url, x, y, x + width, y + height)
+        try:
+            r = subprocess.run(["osascript", "-e", script], timeout=90,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
+    try:
+        webbrowser.open(url, new=1)
+    except Exception:
+        pass
+    return False
+
+
+def _try_app_window(url, server):
+    """Show the UI in a standalone native app window (pywebview). Returns True if it
+    ran the window (and stopped the server on close), False if pywebview isn't there."""
+    import time
+    try:
+        import webview
+    except Exception:
+        print("[web] setting up the standalone app window (one-time install)...")
+        try:
+            _pip("pywebview")
+            import webview
+        except Exception:
+            print("[web] (pywebview unavailable; opening a browser window instead)")
+            return False
+    try:
+        webview.create_window("YouTube 설명 생성기", url, width=1180, height=860)
+    except Exception:
+        return False
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        webview.start()
+    except Exception as ex:
+        print("[web] couldn't open the app window (%s); opening a browser at %s" % (ex, url))
+        _open_browser_window(url)
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            print("\n[web] stopped")
+    try:
+        server.shutdown()
+    except Exception:
+        pass
+    return True
+
+
+# ==========================================================================
+# Web server (stdlib only)
+# ==========================================================================
+def run_web(data_path=DATA_FILE, open_browser=True, host="127.0.0.1", port=0, serve=True):
+    import http.server
+    import urllib.parse
+
+    state = {"data": ensure_data(data_path), "path": os.path.abspath(data_path),
+             "session_backup_done": False}
+    lock = threading.Lock()
+
+    def _save(data, do_backup):
+        with lock:
+            bak = None
+            # First write of the session (or an explicit backup) rotates a numbered
+            # restore point; subsequent autosaves are plain atomic writes (no spam).
+            if do_backup or not state["session_backup_done"]:
+                bak = rotate_numbered_backups(state["path"], 5)
+                state["session_backup_done"] = True
+            atomic_write_json(state["path"], data)
+            state["data"] = data
+            return bak
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype="application/json; charset=utf-8", extra=None):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
             try:
-                src.replace(dst)
+                self.wfile.write(body)
             except Exception:
                 pass
 
-    # 3) create slot 1 from current file (if exists)
-    out = None
-    if p.exists():
-        out = p.with_name(f"{p.stem}_1.json")
-        shutil.copy2(p, out)
-    return str(out) if out else None  # None if first save (no prior file)
+        def _json_body(self):
+            ln = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(ln) if ln else b""
+            try:
+                return json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                return None
 
-def atomic_write_json(json_path: str, data: dict):
-    """
-    Write to tmp, flush+fsync, atomic replace to avoid partial writes.
-    """
-    p = Path(json_path).resolve()
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, p)
+        def do_GET(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/":
+                return self._send(200, _WEB_PAGE, "text/html; charset=utf-8")
+            if u.path == "/api/data":
+                return self._send(200, json.dumps({"data": state["data"], "path": state["path"]}, ensure_ascii=False))
+            if u.path == "/api/export":
+                body = json.dumps(state["data"], ensure_ascii=False, indent=2)
+                name = os.path.basename(state["path"]) or "youtube_data.json"
+                return self._send(200, body, "application/json; charset=utf-8",
+                                  {"Content-Disposition": 'attachment; filename="%s"' % name})
+            return self._send(404, "{}")
 
-# ---------------- Default data + ensure/migrate ----------------
-def get_default_data():
-    return {
-        "songs": {},
-        "groups": {},
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            if u.path == "/api/save":
+                req = self._json_body()
+                if not isinstance(req, dict) or not isinstance(req.get("data"), dict):
+                    return self._send(400, json.dumps({"ok": False, "error": "bad data"}))
+                try:
+                    _save(req["data"], do_backup=False)
+                    return self._send(200, json.dumps({"ok": True, "time": datetime.now().strftime("%H:%M:%S")}))
+                except Exception as ex:
+                    return self._send(200, json.dumps({"ok": False, "error": str(ex)}))
+            if u.path == "/api/backup":
+                try:
+                    bak = rotate_numbered_backups(state["path"], 5)
+                    state["session_backup_done"] = True
+                    return self._send(200, json.dumps({"ok": bool(bak), "name": os.path.basename(bak) if bak else ""}))
+                except Exception as ex:
+                    return self._send(200, json.dumps({"ok": False, "error": str(ex)}))
+            if u.path == "/api/import":
+                req = self._json_body() or {}
+                text = (req.get("text") or "").strip()
+                if not text:
+                    append_import_log(state["path"], "WARN", "Empty import content")
+                    return self._send(200, json.dumps({"ok": False, "error": "empty"}))
+                try:
+                    obj = json.loads(text)
+                except Exception as ex:
+                    append_import_log(state["path"], "ERROR", "JSON parse failed", str(ex))
+                    return self._send(200, json.dumps({"ok": False, "error": "JSON parse: " + str(ex)}))
+                src = obj
+                if isinstance(obj, dict) and "songs" not in obj and looks_like_songs_map(obj):
+                    src = {"songs": obj}
+                try:
+                    src = normalize_data(src)
+                except Exception:
+                    pass
+                try:
+                    with lock:
+                        rotate_numbered_backups(state["path"], 5)
+                        state["session_backup_done"] = True
+                        stats = merge_data_non_destructive(state["data"], src)
+                        atomic_write_json(state["path"], state["data"])
+                    added = (stats["songs_added"] + stats["groups_added"] + stats["characters_added"]
+                             + stats["costumes_added"] + stats["mods_added"])
+                    summary = "항목 +%d, 카테고리 +%d, 설정 +%d" % (
+                        added,
+                        stats["song_cat_updates"] + stats["costume_cat_updates"] + stats["char_costume_cat_updates"],
+                        stats["settings_filled"])
+                    append_import_log(state["path"], "INFO", "Import success", summary)
+                    return self._send(200, json.dumps({"ok": True, "data": state["data"],
+                                                        "stats": stats, "summary": summary}, ensure_ascii=False))
+                except Exception as ex:
+                    append_import_log(state["path"], "ERROR", "Merge/Save failed", str(ex))
+                    return self._send(200, json.dumps({"ok": False, "error": str(ex)}))
+            return self._send(404, "{}")
+
+    server = http.server.ThreadingHTTPServer((host, port), H)
+    if not serve:
+        return server, state
+    url = "http://%s:%d/" % (host, server.server_address[1])
+    print("[web] YouTube 설명 생성기 UI:", url, "  (Ctrl-C to stop)")
+    print("[web] data file:", state["path"])
+    if open_browser and _try_app_window(url, server):
+        return
+    if open_browser:
+        threading.Thread(target=_open_browser_window, args=(url,), daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[web] stopped")
+    finally:
+        server.server_close()
+
+
+# ==========================================================================
+# Headless CLI helpers + selftest
+# ==========================================================================
+def cli_generate(a):
+    data = ensure_data(a.data)
+    sel = {
+        "atype": a.atype,
+        "artist": a.artist or "",
+        "song": a.song or "",
+        "costume": a.costume or "",
+        "ratio": a.ratio or "",
+        "vtype": a.vtype,
+        "mods": [m.strip() for m in (a.mods or "").split(",") if m.strip()],
+        "solos": [s.strip() for s in (a.solos or "").split(",") if s.strip()],
+    }
+    print(generate_description(data, sel))
+
+
+def selftest():
+    data = {
+        "songs": {"S": {"japanese": "曲J", "korean": "곡K", "english": "SongE"}},
+        "groups": {"G": {"japanese": "グG", "korean": "그G", "english": "GrpE",
+                         "artist_playlist": "PL", "hashtags": "#g"}},
         "characters": {},
-        "costumes": {},
-        "mods": {},
-        "song_categories": {"μ's": [], "Aqours": [], "Nijigasaki": [], "Solo": [], "Other": []},
-        "costume_categories": {"μ's": [], "Aqours": [], "Nijigasaki": [], "Event": []},
-        "character_costume_categories": {},
+        "costumes": {"C": {"japanese": "衣", "korean": "의", "english": "Cos", "costume_playlist": "CPL"}},
+        "mods": {"M": {"japanese": "モ", "korean": "모", "english": "ModE", "has_value": False}},
         "settings": {
-            "aspect_ratios": ["16:9", "16:10", "4:3", "21:9"],
-            "format_order": ["{playlist}", "{hashtags}", "{japanese}", "{korean}", "{english}"],
             "languages": ["japanese", "korean", "english"],
-            "japanese_format": "{song} ({artist}, {mod}, {costume})[{ratio}][スクスタ {type}]",
-            "korean_format": "{song} ({artist}, {mod}, {costume})[{ratio}][스쿠스타 {type}]",
-            "english_format": "{song} ({artist}, {mod}, {costume})[{ratio}][SIFAS {type}]",
-            "keep_mod_selection": False,
-            # category-based costume filter
-            "enable_costume_category_filter": False,
-            "costume_category_whitelist": []
+            "format_order": ["{playlist}", "{japanese}", "{korean}", "{english}", "{hashtags}"],
+            "japanese_format": "[スクスタ {type}] {song} ({artist}, {mod}, {costume}){ratio}",
+            "korean_format": "[스쿠스타 {type}] {song} ({artist}, {mod}, {costume}){ratio}",
+            "english_format": "[SIFAS {type}] {song} ({artist}, {mod}, {costume}){ratio}",
         },
     }
+    sel = {"atype": "groups", "artist": "G", "song": "S", "costume": "C",
+           "ratio": "16:9", "vtype": "MOD", "mods": ["M"], "solos": []}
+    got = generate_description(data, sel)
+    expect = (
+        "G playlist : PL | Costume playlist : CPL\n"
+        "[スクスタ MOD] 曲J (グG, モ, 衣衣装)[16:9]\n"
+        "[스쿠스타 MOD] 곡K (그G, 모, 의 의상)[16:9]\n"
+        "[SIFAS MOD] SongE (GrpE, ModE, Cos Costume)[16:9]\n"
+        "#スクスタ #SIFAS #스쿠스타 #lovelive #ラブライブ #MOD #g"
+    )
+    ok = got == expect
+    print("[selftest] generate_description:", "OK" if ok else "FAIL")
+    if not ok:
+        print("--- got ---\n" + got + "\n--- expected ---\n" + expect)
 
-def ensure_data():
-    # create if missing
-    p = Path(DATA_FILE).resolve()
-    if not p.exists():
-        atomic_write_json(DATA_FILE, get_default_data())
+    # single-empty (costume empty, mod present) collapses cleanly
+    sel2 = dict(sel, costume="")
+    line2 = generate_description(data, sel2).split(chr(10))[1]
+    ok2 = line2 == "[スクスタ MOD] 曲J (グG, モ)[16:9]"
+    print("[selftest] single-empty cleanup:", "OK" if ok2 else "FAIL", "->", repr(line2))
 
-    # load
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = get_default_data()
+    # both-empty (plain MV: no mod, no costume) -> no stray trailing comma
+    sel2b = dict(sel, costume="", mods=[], vtype="MV")
+    line2b = generate_description(data, sel2b).split(chr(10))[1]
+    ok2b = line2b == "[スクスタ MV] 曲J (グG)[16:9]"
+    print("[selftest] both-empty cleanup:", "OK" if ok2b else "FAIL", "->", repr(line2b))
+    ok2 = ok2 and ok2b
 
-    # ensure default keys
-    default = get_default_data()
-    for k, v in default.items():
-        if k not in data:
-            data[k] = v
-    for k, v in default["settings"].items():
-        if k not in data["settings"]:
-            data["settings"][k] = v
-    if "character_costume_categories" not in data:
-        data["character_costume_categories"] = {}
+    # merge is non-destructive
+    dst = {"songs": {"S": {"japanese": "orig"}}}
+    merge_data_non_destructive(dst, {"songs": {"S": {"japanese": "new", "korean": "k"}, "T": {"english": "T"}}})
+    ok3 = dst["songs"]["S"]["japanese"] == "orig" and dst["songs"]["S"]["korean"] == "k" and "T" in dst["songs"]
+    print("[selftest] merge non-destructive:", "OK" if ok3 else "FAIL")
 
-    # migrate old costume_categories["Character"] -> character_costume_categories
-    cc = data.get("costume_categories", {})
-    if "Character" in cc and isinstance(cc["Character"], dict):
-        for ch, lst in cc["Character"].items():
-            if not isinstance(lst, list):
-                continue
-            seen, uniq = set(), []
-            for key in lst:
-                if key in data.get("costumes", {}) and key not in seen:
-                    uniq.append(key)
-                    seen.add(key)
-            if uniq:
-                data["character_costume_categories"].setdefault(ch, {})
-                base = data["character_costume_categories"][ch].get("Default", [])
-                merged = base + [k for k in uniq if k not in base]
-                data["character_costume_categories"][ch]["Default"] = merged
-        try:
-            del data["costume_categories"]["Character"]
-        except Exception:
-            pass
+    all_ok = ok and ok2 and ok3
+    print("[selftest]", "ALL PASS" if all_ok else "SOME FAILED")
+    return all_ok
 
-    # persist normalized data
-    atomic_write_json(DATA_FILE, data)
-    return data
 
-def normalize_data(data):
-    default = get_default_data()  # 기본 스키마 로드
-    out = deepcopy(data) if isinstance(data, dict) else {}
-    # 1) 섹션 기본값 채우기
-    for k, v in default.items():
-        if k not in out:
-            out[k] = deepcopy(v)
-    # 2) settings 기본키 보정
-    s = out.setdefault("settings", {})
-    s.setdefault("enable_costume_category_filter", False)
-    s.setdefault("costume_category_whitelist", [])
-    # 3) 레거시 이관: costume_categories.Character -> character_costume_categories
-    cc = out.get("costume_categories", {})
-    if isinstance(cc, dict) and "Character" in cc and isinstance(cc["Character"], dict):
-        for ch, lst in cc["Character"].items():
-            if not isinstance(lst, list):
-                continue
-            uniq, seen = [], set()
-            for key in lst:
-                if key in out.get("costumes", {}) and key not in seen:
-                    uniq.append(key); seen.add(key)
-            base = out.setdefault("character_costume_categories", {}).get(ch, {})
-            merged = list(base.get("Default", []))
-            for k in uniq:
-                if k not in merged:
-                    merged.append(k)
-            out.setdefault("character_costume_categories", {}).setdefault(ch, {})["Default"] = merged
-        try:
-            del out["costume_categories"]["Character"]
-        except Exception:
-            pass
+# ==========================================================================
+# main / argparse
+# ==========================================================================
+def build_static(data_path=DATA_FILE, out=None):
+    """Write a standalone index.html that runs with NO server: the current data is
+    baked in as a seed and the app persists to the browser's localStorage. Open it
+    on any device (phone/tablet/PC/Mac) or host it on GitHub Pages."""
+    data = ensure_data(data_path)
+    out = out or str(Path(__file__).with_name("index.html"))
+    seed = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")  # keep it inside <script>
+    inject = "<body>\n<script>window.__SEED__=" + seed + ";window.__STATIC__=true;</script>"
+    html = _WEB_PAGE.replace("<body>", inject, 1)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    print("[build-static] wrote %s (%d KB)" % (out, len(html.encode("utf-8")) // 1024))
+    print("[build-static] 이 파일을 열기만 하면 브라우저에서 바로 동작합니다 (서버 불필요).")
     return out
 
-# ---------------- Editable combo with optional categories ----------------
-class EditableComboQt(QWidget):
-    """
-    A combo with optional category filter (for songs/costumes), CRUD helpers,
-    and selection-preserving refresh.
-    """
-    def __init__(self, label, value_dict, on_update, kind, data, parent=None):
-        super().__init__(parent)
-        self.value_dict = value_dict
-        self.on_update = on_update
-        self.kind = kind  # "groups"|"characters"|"songs"|"costumes"
-        self.data = data
 
-        root = QVBoxLayout(self)
-        title = QLabel(label)
-        root.addWidget(title)
+def build_parser():
+    p = argparse.ArgumentParser(description="SIFAS/스쿠스타 YouTube 설명 생성기 (web UI).")
+    p.add_argument("--web", action="store_true", help="launch the browser-based interface (default)")
+    p.add_argument("--no-browser", action="store_true", help="serve only; don't open a window (headless/remote)")
+    p.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=0, help="bind port (default: auto)")
+    p.add_argument("--data", default=DATA_FILE, help="path to the data JSON (default: youtube_data.json)")
+    sub = p.add_subparsers(dest="cmd")
+    g = sub.add_parser("generate", help="print one description headlessly")
+    g.add_argument("--data", default=DATA_FILE)
+    g.add_argument("--atype", choices=["groups", "characters"], default="groups")
+    g.add_argument("--artist", default="")
+    g.add_argument("--song", default="")
+    g.add_argument("--costume", default="")
+    g.add_argument("--ratio", default="")
+    g.add_argument("--vtype", choices=["MOD", "MV"], default="MOD")
+    g.add_argument("--mods", default="", help="comma-separated mod keys")
+    g.add_argument("--solos", default="", help="comma-separated character keys (for atype=characters)")
+    sub.add_parser("selftest", help="check the generation logic")
+    bs = sub.add_parser("build-static", help="write a standalone index.html (no server; any browser)")
+    bs.add_argument("--data", default=DATA_FILE)
+    bs.add_argument("--out", default=None, help="output path (default: index.html next to this script)")
+    return p
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    if a.cmd == "selftest":
+        sys.exit(0 if selftest() else 1)
+    if a.cmd == "generate":
+        cli_generate(a)
+        return
+    if a.cmd == "build-static":
+        build_static(a.data, a.out)
+        return
+    # default: web UI
+    run_web(data_path=a.data, open_browser=not a.no_browser, host=a.host, port=a.port)
 
-        self.category_combo = None
-        if kind in ("songs", "costumes"):
-            cat_row = QHBoxLayout()
-            self.category_combo = QComboBox()
-            cat_row.addWidget(QLabel("Category"))
-            cat_row.addWidget(self.category_combo)
-            root.addLayout(cat_row)
-            self.update_categories()
-            self.category_combo.currentIndexChanged.connect(self.refresh)
-
-        row = QHBoxLayout()
-        self.combo = QComboBox()
-        self.combo.setMinimumContentsLength(24)
-        row.addWidget(self.combo, 1)
-
-        self.btn_add = QPushButton("+")
-        self.btn_edit = QPushButton("✎")
-        self.btn_del = QPushButton("✕")
-        row.addWidget(self.btn_add)
-        row.addWidget(self.btn_edit)
-        row.addWidget(self.btn_del)
-
-        if kind in ("songs", "costumes"):
-            self.btn_cat = QPushButton("📁")
-            row.addWidget(self.btn_cat)
-
-        root.addLayout(row)
-
-        self.btn_add.clicked.connect(self.create_item)
-        self.btn_edit.clicked.connect(self.edit_item)
-        self.btn_del.clicked.connect(self.delete_item)
-        if kind in ("songs", "costumes"):
-            self.btn_cat.clicked.connect(self.manage_category)
-
-        self.combo.currentIndexChanged.connect(lambda _: self.on_update())
-        self.refresh()
-
-    def get(self):
-        return self.combo.currentText().strip()
-
-    def update_categories(self):
-        if not self.category_combo:
-            return
-        cats = ["All"]
-        if self.kind == "songs":
-            cats += list(self.data["song_categories"].keys())
-        else:
-            cats += list(self.data["costume_categories"].keys())
-        self.category_combo.clear()
-        self.category_combo.addItems(cats)
-
-    def _items_from_category(self):
-        keys = list(self.value_dict.keys())
-        if not self.category_combo:
-            return keys
-        sel = self.category_combo.currentText()
-        if sel == "All" or not sel:
-            return keys
-        if self.kind == "songs":
-            pool = self.data["song_categories"].get(sel, [])
-        else:
-            pool = self.data["costume_categories"].get(sel, [])
-        return [k for k in pool if k in self.value_dict]
-
-    def refresh(self, select_first=True):
-        items = self._items_from_category()
-        cur = self.combo.currentText()
-        self.combo.blockSignals(True)
-        self.combo.clear()
-        self.combo.addItems(items)
-        if cur and cur in items:
-            self.combo.setCurrentText(cur)
-        elif select_first and items:
-            self.combo.setCurrentIndex(0)
-        self.combo.blockSignals(False)
-
-    def _ask_text(self, title, init=""):
-        txt, ok = QInputDialog.getText(self, title, title, text=init)
-        if not ok:
-            return None
-        return (txt or "").strip()
-
-    def create_item(self):
-        key = self._ask_text("New")
-        if not key:
-            return
-        if key in self.value_dict:
-            return
-
-        new = {}
-        for f in ("japanese", "korean", "english"):
-            v = self._ask_text(f)
-            if v is None:
-                return
-            new[f] = v
-
-        if self.kind in ("groups", "characters"):
-            ap = self._ask_text("ArtistPlaylist") or ""
-            new["artist_playlist"] = ap
-            ht = self._ask_text("tags") or ""
-            new["hashtags"] = ht
-
-        if self.kind == "costumes":
-            cp = self._ask_text("CostumePlaylist") or ""
-            new["costume_playlist"] = cp
-
-        self.value_dict[key] = new
-
-        if self.kind == "songs":
-            cats = list(self.data["song_categories"].keys())
-            cat = self._ask_text("Category")
-            if cat in cats:
-                for L in self.data["song_categories"].values():
-                    if key in L:
-                        L.remove(key)
-                self.data["song_categories"][cat].append(key)
-
-        if self.kind == "costumes":
-            cat = self._ask_text("Category")
-            if cat in self.data["costume_categories"]:
-                for L in self.data["costume_categories"].values():
-                    if isinstance(L, list) and key in L:
-                        L.remove(key)
-                self.data["costume_categories"][cat].append(key)
-                
-
-        if self.category_combo:
-            self.update_categories()
-        self.refresh()
-        self.on_update()
-
-    def edit_item(self):
-        key = self.get()
-        if not key:
-            return
-        item = deepcopy(self.value_dict.get(key, {}))
-        if not item:
-            return
-
-        new_item = {}
-        for f, cur in item.items():
-            if f in ("artist_playlist", "costume_playlist", "hashtags"):
-                continue
-            val = self._ask_text(f, init=str(cur))
-            if val is None:
-                return
-            new_item[f] = val
-
-        if self.kind in ("groups", "characters"):
-            ap = self._ask_text("ArtistPlaylist", init=item.get("artist_playlist", "")) or ""
-            new_item["artist_playlist"] = ap
-            ht = self._ask_text("tags", init=item.get("hashtags", "")) or ""
-            new_item["hashtags"] = ht
-
-        if self.kind == "costumes":
-            cp = self._ask_text("CostumePlaylist", init=item.get("costume_playlist", "")) or ""
-            new_item["costume_playlist"] = cp
-
-        self.value_dict[key] = new_item
-        self.refresh(select_first=False)
-        self.on_update()
-
-    def delete_item(self):
-        key = self.get()
-        if not key:
-            return
-        if QMessageBox.question(self, "Delete", key) != QMessageBox.Yes:
-            return
-        if key in self.value_dict:
-            del self.value_dict[key]
-        for L in self.data["song_categories"].values():
-            if key in L:
-                L.remove(key)
-        for d in self.data["costume_categories"].values():
-            if isinstance(d, list) and key in d:
-                d.remove(key)
-        self.refresh()
-        self.on_update()
-
-
-
-    def refresh(self, select_first=True):
-        items = self._items_from_category()
-
-        cur = self.combo.currentText()
-        self.combo.blockSignals(True)
-        self.combo.clear()
-        self.combo.addItems(items)
-        if cur and cur in items:
-            self.combo.setCurrentText(cur)
-        elif select_first and items:
-            self.combo.setCurrentIndex(0)
-        self.combo.blockSignals(False)
-
-
-
-    def manage_category(self):
-        key = self.get()
-        if not key:
-            return
-        if self.kind == "songs":
-            cats = list(self.data["song_categories"].keys())
-            cat = self._ask_text("Category")
-            if cat in cats:
-                for L in self.data["song_categories"].values():
-                    if key in L:
-                        L.remove(key)
-                self.data["song_categories"][cat].append(key)
-        else:
-            cat = self._ask_text("Category")
-            if cat in self.data["costume_categories"]:
-                for L in self.data["costume_categories"].values():
-                    if isinstance(L, list) and key in L:
-                        L.remove(key)
-                self.data["costume_categories"][cat].append(key)
-
-    def _allowed_costume_categories(self):
-        if self.kind != "costumes":
-            return None
-        s = self.data.get("settings", {})
-        if not s.get("enable_costume_category_filter", False):
-            return None
-        wl = [str(x).strip() for x in s.get("costume_category_whitelist", []) if str(x).strip()]
-        return wl or None
-
-    def _costume_in_allowed_categories(self, costume_key, wl):
-        if not wl:
-            return True
-        cc = self.data.get("costume_categories", {})
-        for cat in wl:
-            arr = cc.get(cat, [])
-            if isinstance(arr, list) and costume_key in arr:
-                return True
-        return False
-
-    def _apply_costume_category_filter(self, keys):
-        if self.kind != "costumes":
-            return keys
-        wl = self._allowed_costume_categories()
-        if not wl:
-            return keys
-        return [k for k in keys if self._costume_in_allowed_categories(k, wl)]
-
-    def refresh(self, select_first=True):
-        items = self._items_from_category()
-        items = self._apply_costume_category_filter(items)
-        cur = self.combo.currentText()
-        self.combo.blockSignals(True)
-        self.combo.clear()
-        self.combo.addItems(items)
-        if cur and cur in items:
-            self.combo.setCurrentText(cur)
-        elif select_first and items:
-            self.combo.setCurrentIndex(0)
-        self.combo.blockSignals(False)
-
-# ---------------- Main window ----------------
-class YoutubeDescAppQt(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("YouTube 설명 생성기 (Qt)")
-        # 추가: 현재 작업 파일 경로 상태
-        self.data_path = DATA_FILE  # 기본은 스크립트 옆 youtube_data.json
-
-        self.data = ensure_data()
-        self.mod_cache = []
-        self._charcos_selected = ""  # current selected CharacterCostume
-
-        self._build_menu()
-        self._build_ui()
-        self.refresh()
-
-        # Size and scroll management
-        geo = QGuiApplication.primaryScreen().availableGeometry()
-        w = int(geo.width() * 0.9)
-        h = int(geo.height() * 0.9)
-        self.resize(w, h)
-        self.setMaximumSize(geo.width(), geo.height())
-        self.setMinimumSize(960, 680)
-
-    # ---------------- Menu ----------------
-    def _build_menu(self):
-        mb = self.menuBar()
-        file_menu = mb.addMenu("File")
-        act_open = QAction("Open json...", self)
-        act_save = QAction("Save", self)
-        act_backup = QAction("Backup Data Now", self)
-        act_import_values = QAction("Import JSON values...", self)  # 추가
-        
-        file_menu.addAction(act_open)
-        file_menu.addAction(act_save)
-        file_menu.addAction(act_backup)
-        act_open.triggered.connect(self.open_json)
-        act_save.triggered.connect(self.save)
-        
-        act_backup.triggered.connect(
-            lambda: QMessageBox.information(
-                self,
-                "Backup",
-                f"Backup: {rotate_numbered_backups(self.data_path, 5) or 'No previous file'}",
-            )
-        )
-        act_import_values.triggered.connect(self.import_json_values)  # 추가
-
-    # ---------------- UI ----------------
-    def _build_ui(self):
-        # Build the two-pane layout
-        root = QWidget()
-        root_layout = QHBoxLayout(root)
-
-        # Left side: Selection/Manage
-        left_box = QGroupBox("Selection/Manage")
-        left = QVBoxLayout(left_box)
-
-        # Artist Type
-        type_row = QHBoxLayout()
-        self.atype_combo = QComboBox()
-        self.atype_combo.addItems(["groups", "characters"])
-        type_row.addWidget(QLabel("Artist Type"))
-        type_row.addWidget(self.atype_combo)
-        left.addLayout(type_row)
-
-        # Artist selector
-        self.artist = EditableComboQt(
-            "Artist",
-            self.data[self.atype_combo.currentText()],
-            self.refresh,
-            self.atype_combo.currentText(),
-            self.data
-        )
-        left.addWidget(self.artist)
-
-        # Song selector
-        self.song = EditableComboQt(
-            "Song",
-            self.data["songs"],
-            self.refresh,
-            "songs",
-            self.data
-        )
-        left.addWidget(self.song)
-
-        # Multi-solo selection (for characters)
-        self.solo_box = QGroupBox("Selected Solos")
-        vb_solo = QVBoxLayout(self.solo_box)
-        self.solo_list = QListWidget()
-        self.solo_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        vb_solo.addWidget(self.solo_list)
-        solo_btns = QHBoxLayout()
-        self.btn_solo_add = QPushButton("Add solo")
-        self.btn_solo_del = QPushButton("Remove selected")
-        self.btn_solo_clear = QPushButton("Clear")
-        solo_btns.addWidget(self.btn_solo_add)
-        solo_btns.addWidget(self.btn_solo_del)
-        solo_btns.addWidget(self.btn_solo_clear)
-        vb_solo.addLayout(solo_btns)
-        left.addWidget(self.solo_box)
-
-        self.solo_box.setVisible(self.atype_combo.currentText() == "characters")
-        self.btn_solo_add.clicked.connect(self._solo_add)
-        self.btn_solo_del.clicked.connect(self._solo_del)
-        self.btn_solo_clear.clicked.connect(self._solo_clear)
-        self.solo_list.itemSelectionChanged.connect(self.generate)
-
-        # Costume selector (global)
-        self.costume = EditableComboQt(
-            "Costume",
-            self.data["costumes"],
-            self.refresh,
-            "costumes",
-            self.data
-        )
-        left.addWidget(self.costume)
-        btn_no_costume = QPushButton("No Costume")
-        btn_no_costume.clicked.connect(lambda: (self.costume.combo.setCurrentIndex(-1), self.refresh()))
-        left.addWidget(btn_no_costume)
-
-
-        # NEW: Costume rarity filter editor
-        flt_box = QGroupBox("Costume Filter")
-        flt = QVBoxLayout(flt_box)
-
-        self.chk_costume_filter = QCheckBox("Enable category whitelist")
-        flt.addWidget(self.chk_costume_filter)
-
-        self.list_costume_cats = QListWidget()
-        self.list_costume_cats.setSelectionMode(QAbstractItemView.NoSelection)
-        flt.addWidget(self.list_costume_cats, 1)
-
-        btn_save_filter = QPushButton("Save Filter")
-        btn_save_filter.clicked.connect(self.save_costume_filter)
-        flt.addWidget(btn_save_filter)
-
-        left.addWidget(flt_box)
-
-
-
-
-        # CharacterCostume panel (per-character)
-        self.charcos_box = QGroupBox("CharacterCostume (per character)")
-        charcos = QVBoxLayout(self.charcos_box)
-
-        # Category row
-        cat_row = QHBoxLayout()
-        cat_row.addWidget(QLabel("Category"))
-        self.charcos_cat_combo = QComboBox()
-        cat_row.addWidget(self.charcos_cat_combo, 1)
-        self.btn_charcos_cat_add = QPushButton("＋")
-        self.btn_charcos_cat_ren = QPushButton("✎")
-        self.btn_charcos_cat_del = QPushButton("✕")
-        cat_row.addWidget(self.btn_charcos_cat_add)
-        cat_row.addWidget(self.btn_charcos_cat_ren)
-        cat_row.addWidget(self.btn_charcos_cat_del)
-        charcos.addLayout(cat_row)
-
-        # List in category
-        self.charcos_list = QListWidget()
-        self.charcos_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        charcos.addWidget(self.charcos_list)
-
-        sel_row = QHBoxLayout()
-        self.btn_charcos_clear_sel = QPushButton("Clear Selection")
-        sel_row.addWidget(self.btn_charcos_clear_sel)
-        charcos.addLayout(sel_row)
-
-        # Add/remove to category
-        add_row = QHBoxLayout()
-        self.charcos_add_combo = QComboBox()
-        add_row.addWidget(self.charcos_add_combo, 1)
-        self.btn_charcos_add = QPushButton("Add to Category")
-        self.btn_charcos_remove = QPushButton("Remove from Category")
-        add_row.addWidget(self.btn_charcos_add)
-        add_row.addWidget(self.btn_charcos_remove)
-        charcos.addLayout(add_row)
-
-        left.addWidget(self.charcos_box)
-
-        # Mods
-        mod_box = QGroupBox("Mods")
-        mod_layout = QVBoxLayout(mod_box)
-        self.mods = QListWidget()
-        self.mods.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        mod_layout.addWidget(self.mods)
-        mod_btns = QHBoxLayout()
-        btn_add = QPushButton("+")
-        btn_edit = QPushButton("✎")
-        btn_del = QPushButton("✕")
-        mod_btns.addWidget(btn_add)
-        mod_btns.addWidget(btn_edit)
-        mod_btns.addWidget(btn_del)
-        mod_layout.addLayout(mod_btns)
-        btn_add.clicked.connect(self.add_mod)
-        btn_edit.clicked.connect(self.edit_mod)
-        btn_del.clicked.connect(self.del_mod)
-        left.addWidget(mod_box)
-
-        # Aspect Ratios
-        left.addWidget(self._hline())
-        left.addWidget(QLabel("Aspect Ratios"))
-        self.ratio = QComboBox()
-        left.addWidget(self.ratio)
-        btn_edit_ratio = QPushButton("Edit Ratios")
-        btn_edit_ratio.clicked.connect(self.edit_ratio)
-        left.addWidget(btn_edit_ratio)
-
-        # Video Type
-        left.addWidget(self._hline())
-        left.addWidget(QLabel("Video Type"))
-        self.vtype = QComboBox()
-        self.vtype.addItems(["MOD", "MV"])
-        left.addWidget(self.vtype)
-
-        # Right side: Preview/Settings
-        right_box = QGroupBox("Preview/Settings")
-        right = QVBoxLayout(right_box)
-
-        right.addWidget(self._hline())
-        lbl_prev = QLabel("Preview")
-        font = lbl_prev.font()
-        font.setPointSize(12)
-        font.setBold(True)
-        lbl_prev.setFont(font)
-        right.addWidget(lbl_prev)
-
-        self.out = QPlainTextEdit()
-        self.out.setReadOnly(True)
-        right.addWidget(self.out)
-        btn_copy = QPushButton("Copy Clipboard")
-        btn_copy.clicked.connect(self.copy)
-        right.addWidget(btn_copy)
-
-        right.addWidget(self._hline())
-
-        # Line order
-        order_box = QGroupBox("Line Order")
-        order_layout = QHBoxLayout(order_box)
-        self.ol = QListWidget()
-        order_layout.addWidget(self.ol, 1)
-        ob = QVBoxLayout()
-        btn_up = QPushButton("⬆️")
-        btn_dn = QPushButton("⬇️")
-        btn_sv = QPushButton("💾")
-        ob.addWidget(btn_up)
-        ob.addWidget(btn_dn)
-        ob.addWidget(btn_sv)
-        order_layout.addLayout(ob)
-        btn_up.clicked.connect(lambda: self.move(-1))
-        btn_dn.clicked.connect(lambda: self.move(1))
-        btn_sv.clicked.connect(self.save_order)
-        right.addWidget(order_box)
-
-        right.addWidget(self._hline())
-
-        # Formats
-        ff = QGroupBox("Formats")
-        fl = QVBoxLayout(ff)
-        self.fes = {}
-        for lang in self.data["settings"]["languages"]:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(lang), 0)
-            e = QLineEdit()
-            row.addWidget(e, 1)
-            self.fes[lang] = e
-            fl.addLayout(row)
-        btn_fmt_save = QPushButton("Save Formats")
-        btn_fmt_save.clicked.connect(self.save_formats)
-        fl.addWidget(btn_fmt_save)
-        right.addWidget(ff, 1)
-
-        # Assemble root layout
-        root_layout.addWidget(left_box, 0)
-        root_layout.addWidget(right_box, 1)
-
-        # Wrap central widget in a scroll area (so bottom is always reachable)
-        container = QWidget()
-        container.setLayout(root_layout)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(container)
-        self.setCentralWidget(scroll)
-
-        # Signals
-        self.atype_combo.currentIndexChanged.connect(self._on_atype_changed)
-        self.vtype.currentIndexChanged.connect(self.generate)
-        self.ratio.currentIndexChanged.connect(self.generate)
-        self.mods.itemSelectionChanged.connect(self.generate)
-
-        # CharacterCostume signals
-        self.charcos_cat_combo.currentIndexChanged.connect(self._refresh_charcos_content)
-        self.charcos_list.itemSelectionChanged.connect(self._on_charcos_selected_changed)
-        self.btn_charcos_clear_sel.clicked.connect(self._clear_charcos_selection)
-        self.btn_charcos_cat_add.clicked.connect(self._charcos_add_category)
-        self.btn_charcos_cat_ren.clicked.connect(self._charcos_rename_category)
-        self.btn_charcos_cat_del.clicked.connect(self._charcos_delete_category)
-        self.btn_charcos_add.clicked.connect(self._charcos_add_to_category)
-        self.btn_charcos_remove.clicked.connect(self._charcos_remove_from_category)
-
-    def save_costume_filter(self):
-        s = self.data["settings"]
-        s["enable_costume_category_filter"] = self.chk_costume_filter.isChecked()
-        wl = []
-        for i in range(self.list_costume_cats.count()):
-            it = self.list_costume_cats.item(i)
-            if it.checkState() == Qt.Checked:
-                wl.append(it.text())
-        s["costume_category_whitelist"] = wl
-        self.save()
-        self.refresh()
-
-    def _sync_costume_filter_ui(self):
-        cats = list(self.data.get("costume_categories", {}).keys())
-        s = self.data.get("settings", {})
-        wl = set(s.get("costume_category_whitelist", []))
-
-        self.list_costume_cats.blockSignals(True)
-        self.list_costume_cats.clear()
-        for c in cats:
-            it = QListWidgetItem(c)
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(Qt.Checked if c in wl else Qt.Unchecked)
-            self.list_costume_cats.addItem(it)
-        self.list_costume_cats.blockSignals(False)
-
-        self.chk_costume_filter.blockSignals(True)
-        self.chk_costume_filter.setChecked(s.get("enable_costume_category_filter", False))
-        self.chk_costume_filter.blockSignals(False)
-
-
-    def _hline(self):
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        return line
-
-    # ---------------- Events/logic ----------------
-    def _on_atype_changed(self):
-        at = self.atype_combo.currentText()
-        self.artist.value_dict = self.data[at]
-        self.artist.kind = at
-        if hasattr(self.artist, "update_categories"):
-            self.artist.update_categories()
-        self.artist.refresh(select_first=True)  # init on type switch
-        self.refresh()  # afterwards keep selection in refresh
-        self._refresh_solo_box()
-
-    def toggle_keep(self):
-        s = self.data["settings"]
-        s["keep_mod_selection"] = not s["keep_mod_selection"]
-        self.save()
-        QMessageBox.information(self, "MOD Keep Toggled", str(s["keep_mod_selection"]))
-
-    def save_mod(self):
-        self.mod_cache = [i.text() for i in self.mods.selectedItems()]
-
-    def restore_mod(self):
-        if not self.data["settings"].get("keep_mod_selection", False):
-            return
-        for i in range(self.mods.count()):
-            it = self.mods.item(i)
-            it.setSelected(it.text() in self.mod_cache)
-
-    # ---------- CharacterCostume helpers ----------
-    def _ensure_charcos_min(self, ak):
-        cc = self.data["character_costume_categories"].setdefault(ak, {})
-        if not cc:
-            cc["Default"] = []
-        return cc
-
-    def _refresh_charcos_panel(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        enabled = (at == "characters" and bool(ak))
-        self.charcos_box.setEnabled(enabled)
-        if not enabled:
-            self._charcos_selected = ""
-            self.charcos_cat_combo.clear()
-            self.charcos_list.clear()
-            self.charcos_add_combo.clear()
-            return
-
-        cc = self._ensure_charcos_min(ak)
-        cats = list(cc.keys())
-        cur = self.charcos_cat_combo.currentText()
-        self.charcos_cat_combo.blockSignals(True)
-        self.charcos_cat_combo.clear()
-        self.charcos_cat_combo.addItems(cats)
-        if cur in cats:
-            self.charcos_cat_combo.setCurrentText(cur)
-        self.charcos_cat_combo.blockSignals(False)
-        self._refresh_charcos_content()
-
-    def _refresh_charcos_content(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        if not (at == "characters" and ak):
-            return
-        cc = self._ensure_charcos_min(ak)
-        cat = self.charcos_cat_combo.currentText() or "Default"
-        lst = cc.get(cat, [])
-
-        # list items
-        self.charcos_list.blockSignals(True)
-        self.charcos_list.clear()
-        for k in lst:
-            self.charcos_list.addItem(QListWidgetItem(k))
-        self.charcos_list.blockSignals(False)
-
-
-
-
-        # candidates (global costumes not in current category)
-        s = self.data.get("settings", {})
-        use_filter = s.get("enable_costume_category_filter", False)
-        wl = [x.strip() for x in s.get("costume_category_whitelist", []) if str(x).strip()] if use_filter else None
-        ccats = self.data.get("costume_categories", {})
-
-        def allowed(k):
-            if not wl:
-                return True
-            for c in wl:
-                arr = ccats.get(c, [])
-                if isinstance(arr, list) and k in arr:
-                    return True
-            return False
-
-        candidates = []
-        for k in self.data["costumes"].keys():
-            if k in lst:
-                continue
-            if allowed(k):
-                candidates.append(k)
-
-        self.charcos_add_combo.clear()
-        self.charcos_add_combo.addItems(candidates)
-
-
-
-    def _on_charcos_selected_changed(self):
-        sel = self.charcos_list.selectedItems()
-        self._charcos_selected = sel[0].text() if sel else ""
-        self.generate()
-
-    def _clear_charcos_selection(self):
-        self.charcos_list.clearSelection()
-        self._charcos_selected = ""
-        self.generate()
-
-    def _charcos_add_category(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        if not (at == "characters" and ak):
-            return
-        name, ok = QInputDialog.getText(self, "New Category", "Category name")
-        if not ok:
-            return
-        name = (name or "").strip()
-        if not name:
-            return
-        cc = self._ensure_charcos_min(ak)
-        if name in cc:
-            QMessageBox.warning(self, "Exists", "Already exists")
-            return
-        cc[name] = []
-        self.save()
-        self._refresh_charcos_panel()
-        self.charcos_cat_combo.setCurrentText(name)
-
-    def _charcos_rename_category(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        if not (at == "characters" and ak):
-            return
-        old = self.charcos_cat_combo.currentText()
-        if not old:
-            return
-        name, ok = QInputDialog.getText(self, "Rename Category", "New name", text=old)
-        if not ok:
-            return
-        name = (name or "").strip()
-        if not name or name == old:
-            return
-        cc = self._ensure_charcos_min(ak)
-        if name in cc:
-            QMessageBox.warning(self, "Exists", "Already exists")
-            return
-        cc[name] = cc.pop(old)
-        self.save()
-        self._refresh_charcos_panel()
-        self.charcos_cat_combo.setCurrentText(name)
-
-
-    def import_json_values(self):
-        dlg = ImportJsonDialog(self)
-        if dlg.exec() != QDialog.Accepted:
-            return
-
-        raw = dlg.get_text().strip()
-        if not raw:
-            QMessageBox.warning(self, "Import", "입력된 내용이 없습니다.")
-            append_import_log(self.data_path, "WARN", "Empty import content")
-            return
-
-        # 현재 파일 백업
-        rotate_numbered_backups(self.data_path, 5)
-
-        try:
-            obj = json.loads(raw)
-        except Exception as e:
-            QMessageBox.critical(self, "Import", f"JSON 파싱 실패: {e}")
-            append_import_log(self.data_path, "ERROR", "JSON parse failed", detail=str(e))
-            return
-
-        # 입력이 바로 songs 딕셔너리 형태라면 자동 래핑
-        def looks_like_songs_map(d: dict) -> bool:
-            if not isinstance(d, dict):
-                return False
-            # 값들이 언어 3필드를 주로 가진 경우로 간주
-            cnt, hit = 0, 0
-            for v in list(d.values())[:10]:
-                cnt += 1
-                if isinstance(v, dict) and any(k in v for k in ("japanese", "korean", "english")):
-                    hit += 1
-            return cnt > 0 and hit / cnt >= 0.6
-
-        src = obj
-        if isinstance(obj, dict) and "songs" not in obj and looks_like_songs_map(obj):
-            src = {"songs": obj}
-
-        # normalize_data가 있으면 보강
-        try:
-            src = normalize_data(src)
-        except Exception:
-            pass
-
-        # 병합
-        try:
-            stats = merge_data_non_destructive(self.data, src)
-            atomic_write_json(self.data_path, self.data)
-            self.refresh()
-            msg = (
-                "Import 완료\n"
-                f"- songs/groups/characters/costumes/mods added: "
-                f"{stats['songs_added'] + stats['groups_added'] + stats['characters_added'] + stats['costumes_added'] + stats['mods_added']}\n"
-                f"- categories: song +{stats['song_cat_updates']}, costume +{stats['costume_cat_updates']}, char-costume +{stats['char_costume_cat_updates']}\n"
-                f"- settings filled: {stats['settings_filled']}"
-            )
-            QMessageBox.information(self, "Import", msg)
-            append_import_log(self.data_path, "INFO", "Import success", detail=msg)
-        except Exception as e:
-            QMessageBox.critical(self, "Import", f"병합/저장 실패: {e}")
-            append_import_log(self.data_path, "ERROR", "Merge/Save failed", detail=str(e))
-
-
-    def _charcos_delete_category(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        if not (at == "characters" and ak):
-            return
-        cat = self.charcos_cat_combo.currentText()
-        if not cat:
-            return
-        if QMessageBox.question(self, "Delete Category", cat) != QMessageBox.Yes:
-            return
-        cc = self._ensure_charcos_min(ak)
-        try:
-            del cc[cat]
-        except Exception:
-            pass
-        if not cc:
-            cc["Default"] = []
-        self.save()
-        self._refresh_charcos_panel()
-
-    def _charcos_add_to_category(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        if not (at == "characters" and ak):
-            return
-        cat = self.charcos_cat_combo.currentText() or "Default"
-        key = self.charcos_add_combo.currentText().strip()
-        if not key:
-            return
-        cc = self._ensure_charcos_min(ak)
-        lst = cc.setdefault(cat, [])
-        if key not in lst:
-            lst.append(key)
-        self.save()
-        self._refresh_charcos_content()
-
-    def _charcos_remove_from_category(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        if not (at == "characters" and ak):
-            return
-        cat = self.charcos_cat_combo.currentText() or "Default"
-        sel = self.charcos_list.selectedItems()
-        if not sel:
-            return
-        key = sel[0].text()
-        cc = self._ensure_charcos_min(ak)
-        lst = cc.setdefault(cat, [])
-        if key in lst:
-            lst.remove(key)
-        self._charcos_selected = ""
-        self.save()
-        self._refresh_charcos_content()
-        self.generate()
-
-    def _refresh_solo_box(self):
-        is_char = self.atype_combo.currentText() == "characters"
-        self.solo_box.setVisible(is_char)
-        if not is_char:
-            self.solo_list.clear()
-
-    def _solo_add(self):
-        if self.atype_combo.currentText() != "characters":
-            return
-        k = self.artist.get()
-        if not k:
-            return
-        for i in range(self.solo_list.count()):
-            if self.solo_list.item(i).text() == k:
-                self.generate()
-                return
-        self.solo_list.addItem(QListWidgetItem(k))
-        self.generate()
-
-    def _solo_del(self):
-        sel = self.solo_list.selectedItems()
-        for it in sel:
-            self.solo_list.takeItem(self.solo_list.row(it))
-        self.generate()
-
-    def _solo_clear(self):
-        self.solo_list.clear()
-        self.generate()
-
-    # ---------- Mods ----------
-    def add_mod(self):
-        key, ok = QInputDialog.getText(self, "MOD", "Key")
-        if not ok:
-            return
-        key = key.strip()
-        if not key or key in self.data["mods"]:
-            return
-
-        mi = {}
-        for f in ("japanese", "korean", "english"):
-            v, ok2 = QInputDialog.getText(self, key, f)
-            if not ok2:
-                return
-            mi[f] = v
-        hv = QMessageBox.question(self, "Need Value?", "Need value field?") == QMessageBox.Yes
-        mi["has_value"] = hv
-        if hv:
-            dv, ok3 = QInputDialog.getText(self, "Default", "")
-            mi["default_value"] = dv if ok3 else ""
-        self.data["mods"][key] = mi
-        self.refresh()
-
-    def edit_mod(self):
-        sel = self.mods.selectedItems()
-        if not sel:
-            return
-        key = sel[0].text()
-        mi = self.data["mods"][key]
-        ni = deepcopy(mi)
-        for f in ("japanese", "korean", "english"):
-            v, ok = QInputDialog.getText(self, key, f, text=mi[f])
-            if not ok:
-                return
-            ni[f] = v
-        hv = QMessageBox.question(self, "Need Value?", "Need value field?") == QMessageBox.Yes
-        ni["has_value"] = hv
-        if hv:
-            dv, ok = QInputDialog.getText(self, "Default", "", text=mi.get("default_value", ""))
-            ni["default_value"] = dv if ok else ""
-        else:
-            ni.pop("default_value", None)
-        self.data["mods"][key] = ni
-        self.refresh()
-
-    def del_mod(self):
-        sel = self.mods.selectedItems()
-        if not sel:
-            return
-        key = sel[0].text()
-        if QMessageBox.question(self, "Delete", key) != QMessageBox.Yes:
-            return
-        del self.data["mods"][key]
-        self.refresh()
-
-    # ---------- Other UI utilities ----------
-    def edit_ratio(self):
-        cr = ",".join(self.data["settings"]["aspect_ratios"])
-        nr, ok = QInputDialog.getText(self, "Ratios", "Comma-separated", text=cr)
-        if ok:
-            self.data["settings"]["aspect_ratios"] = [s.strip() for s in nr.split(",") if s.strip()]
-            self.refresh()
-
-    def refresh(self):
-        self.save_mod()
-
-        # Artist widget (preserve selection; do not force first)
-        self.artist.value_dict = self.data[self.atype_combo.currentText()]
-        if hasattr(self.artist, "update_categories"):
-            self.artist.update_categories()
-        self.artist.refresh(select_first=False)
-
-        # Song/Costume widgets
-        if hasattr(self.song, "update_categories"):
-            self.song.update_categories()
-        self.song.refresh(select_first=False)
-
-        if hasattr(self.costume, "update_categories"):
-            self.costume.update_categories()
-        self.costume.refresh(select_first=False)
-
-        # Mods
-        self.mods.clear()
-        for k in self.data["mods"]:
-            self.mods.addItem(QListWidgetItem(k))
-        self.restore_mod()
-
-        # Ratios
-        ar = self.data["settings"]["aspect_ratios"]
-        self.ratio.blockSignals(True)
-        self.ratio.clear()
-        self.ratio.addItems(ar)
-        if ar and self.ratio.currentIndex() < 0:
-            self.ratio.setCurrentIndex(0)
-        self.ratio.blockSignals(False)
-
-        # Order
-        self.ol.clear()
-        for it in self.data["settings"]["format_order"]:
-            self.ol.addItem(it)
-
-        # Formats
-        for lang, e in self.fes.items():
-            e.blockSignals(True)
-            e.setText(self.data["settings"].get(f"{lang}_format", ""))
-            e.blockSignals(False)
-
-        # CharacterCostume
-        self._refresh_solo_box()
-        self._refresh_charcos_panel()
-        self._refresh_solo_box()
-
-
-
-        # Preview
-        self._sync_costume_filter_ui()
-        self.generate()
-
-    def save_formats(self):
-        for lang, e in self.fes.items():
-            self.data["settings"][f"{lang}_format"] = e.text()
-        self.save()
-        self.refresh()
-
-    def move(self, d):
-        row = self.ol.currentRow()
-        if row < 0:
-            return
-        new_row = row + d
-        if new_row < 0 or new_row >= self.ol.count():
-            return
-        order = [self.ol.item(i).text() for i in range(self.ol.count())]
-        order[row], order[new_row] = order[new_row], order[row]
-        self.data["settings"]["format_order"] = order
-        self.refresh()
-        self.ol.setCurrentRow(new_row)
-        self.save()
-
-    def save_order(self):
-        self.data["settings"]["format_order"] = [self.ol.item(i).text() for i in range(self.ol.count())]
-        self.save()
-
-    # --- 4) 저장(save): self.data_path 기준 백업/저장으로 변경 (검색: def save(self))
-    def save(self):
-        # 번호 순환 백업 실행 (현재 작업 파일 기준)
-        bak = rotate_numbered_backups(self.data_path, max_backups=5)
-        try:
-            atomic_write_json(self.data_path, self.data)
-            print(f"[backup] data: {bak}")
-            QMessageBox.information(self, "Backup", f"Backup: {bak or 'No previous file (first save)'}")
-        except Exception as e:
-            QMessageBox.critical(self, "Save error", str(e))
-
-    # --- 5) 열기(open_json): ensure_data 제거, normalize_data 사용 + 작업 경로 전환 (검색: def open_json(self))
-    def open_json(self):
-        fn, _ = QFileDialog.getOpenFileName(self, "Open JSON", "", "JSON (*.json)")
-        if not fn:
-            return
-        try:
-            # 현재 작업 파일을 먼저 백업
-            rotate_numbered_backups(self.data_path, 5)
-
-            # 선택 파일 로드
-            with open(fn, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-
-            # 디스크 쓰기 없이 정상화
-            normalized = normalize_data(loaded)
-
-            # 작업 데이터/경로 전환
-            self.data = normalized
-            self.data_path = fn
-
-            # 선택 파일에 원자적 저장(정상화 결과를 반영)
-            atomic_write_json(self.data_path, self.data)
-
-            # 화면 갱신
-            self.refresh()
-
-        except Exception as e:
-            QMessageBox.critical(self, "Open error", str(e))
-
-    # ---------------- Generate output ----------------
-    def generate(self):
-        at = self.atype_combo.currentText()
-        ak = self.artist.get()
-        sk = self.song.get()
-        sd = self.data["songs"].get(sk, {})
-        ck = self.costume.get()
-        cd = self.data["costumes"].get(ck, {})
-        ar = self.ratio.currentText()
-        tp = self.vtype.currentText()
-        ms = [it.text() for it in self.mods.selectedItems()]
-
-        # costume playlist
-        cpl = (cd.get("costume_playlist") or "").strip()
-
-        # collect artists
-        if at == "characters":
-            sels = [self.solo_list.item(i).text() for i in range(self.solo_list.count())]
-            if not sels and ak:
-                sels = [ak]
-            ad_list = [self.data["characters"].get(k, {}) for k in sels if k in self.data["characters"]]
-            multiple_solo = len(ad_list) >= 2
-            apls = [(ad.get("artist_playlist") or "").strip() for ad in ad_list]
-            apl = "" if multiple_solo else (apls[0] if apls else "")
-
-            if apl and cpl:
-                playlist_line = f"{sels[0]} playlist : {apl} | Costume playlist : {cpl}"
-            elif cpl:
-                playlist_line = f"Costume playlist : {cpl}"
-            elif apl:
-                playlist_line = f"{sels[0]} playlist : {apl}"
-            else:
-                playlist_line = ""
-
-            def artist_str(lng):
-                names = []
-                for k in sels:
-                    d = self.data["characters"].get(k, {})
-                    names.append(d.get(lng, k))
-                return ", ".join(names)
-
-            extra_ht = " ".join([ad.get("hashtags", "") for ad in ad_list if ad.get("hashtags")])
-        else:
-            ad = self.data.get("groups", {}).get(ak, {})
-            apl = (ad.get("artist_playlist") or "").strip()
-            if apl and cpl:
-                playlist_line = f"{ak} playlist : {apl} | Costume playlist : {cpl}"
-            elif cpl:
-                playlist_line = f"Costume playlist : {cpl}"
-            elif apl:
-                playlist_line = f"{ak} playlist : {apl}"
-            else:
-                playlist_line = ""
-            def artist_str(lng):
-                return ad.get(lng, ak)
-            extra_ht = ad.get("hashtags", "")
-
-        # mods string (optional)
-        def mod_str(lng):
-            arr = []
-            for m in ms:
-                md = self.data["mods"].get(m)
-                if not md:
-                    continue
-                nm = md.get(lng, m)
-                if md.get("has_value"):
-                    v = md.get("default_value", "")
-                    arr.append(f"{nm}({v})" if v else nm)
-                else:
-                    arr.append(nm)
-            return ", ".join(arr)
-
-        # costume localized
-        def cos_str(lng):
-            nm = cd.get(lng, "")
-            if not nm:
-                return ""
-            if lng == "japanese":
-                return f"{nm}衣装"
-            if lng == "korean":
-                return f"{nm} 의상"
-            return f"{nm} Costume"
-
-        # hashtags
-        ht = "#スクスタ #SIFAS #스쿠스타 #lovelive #ラブライブ"
-        if tp == "MOD":
-            ht += " #MOD"
-        if extra_ht:
-            ht += " " + extra_ht
-
-        vars_map = {
-            "playlist": playlist_line,
-            "hashtags": ht
-        }
-
-        for lng in self.data["settings"]["languages"]:
-            fmt = self.data["settings"].get(f"{lng}_format", "")
-            mp = {
-                "song": sd.get(lng, sk),
-                "artist": artist_str(lng),
-                "mod": mod_str(lng),
-                "costume": cos_str(lng),
-                "ratio": f"[{ar}]" if ar else "",
-                "type": tp
-            }
-            try:
-                line = fmt.format(**mp)
-                line = line.replace("(, ", "(").replace(", )", ")")
-                line = line.replace("()", "").replace(", ,", ",").strip()
-            except Exception:
-                line = "Format Error"
-            vars_map[lng] = line
-
-        out_lines = []
-        for item in self.data["settings"]["format_order"]:
-            key = item.strip("{}")
-            if vars_map.get(key):
-                out_lines.append(vars_map[key])
-        self.out.setPlainText("\n".join(out_lines))
-
-    def copy(self):
-        c = self.out.toPlainText().strip()
-        if not c:
-            return
-        QGuiApplication.clipboard().setText(c)
-        QMessageBox.information(self, "Copied", "Copied to clipboard")
-
-# ---------------- main ----------------
-def main():
-    app = QApplication(sys.argv)
-    w = YoutubeDescAppQt()
-    w.show()
-    sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()

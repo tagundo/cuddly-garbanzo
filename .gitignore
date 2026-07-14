@@ -1,0 +1,8 @@
+# runtime data backups (numbered rotation created next to youtube_data.json)
+youtube_data_*.json
+youtube_data.json.tmp
+import.log
+
+# python
+__pycache__/
+*.pyc
