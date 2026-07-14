@@ -10,6 +10,16 @@ SIFAS(스쿠스타) MOD/MV 영상용 **다국어(일본어·한국어·영어) Y
 **브라우저 기반**입니다. 파이썬 표준 라이브러리만으로 로컬 서버를 띄우므로
 별도 설치가 필요 없고, 휴대폰·원격 브라우저에서도 접속할 수 있습니다.
 
+두 가지 방식으로 쓸 수 있습니다:
+
+1. **로컬 서버** — PC/맥에서 `python3 youtube_gen_v20.py` 실행. 디스크의
+   `youtube_data.json` 을 직접 읽고 씁니다(자동 저장·백업).
+2. **정적(브라우저 전용)** — 서버가 전혀 필요 없는 단일 `index.html`.
+   아이폰·안드로이드·PC·맥 어디서든 파일을 열기만 하면 동작하고, GitHub Pages
+   등에 올리면 URL 하나로 어느 기기에서나 접속됩니다. 편집 내용은 그 브라우저에
+   저장(localStorage)됩니다. **같은 `index.html` 은 위 로컬 서버가 서빙하면
+   자동으로 서버 모드로 전환**됩니다.
+
 ## 실행
 
 ```bash
@@ -42,6 +52,24 @@ python3 youtube_gen_v20.py generate \
 ```bash
 python3 youtube_gen_v20.py selftest
 ```
+
+## 브라우저만 있으면 되는 정적 배포 (아이폰·안드로이드·PC·맥)
+
+서버 없이 어디서나 열리는 단일 `index.html` 을 만듭니다:
+
+```bash
+python3 youtube_gen_v20.py build-static     # index.html 생성 (현재 데이터를 통째로 내장)
+```
+
+- **바로 열기:** 만들어진 `index.html` 을 기기로 보내 브라우저로 열면 끝입니다.
+  (홈 화면에 "추가"하면 앱처럼 전체화면으로 실행됩니다.)
+- **URL 로 공유(GitHub Pages):** `index.html` 을 저장소에 커밋한 뒤
+  **Settings → Pages → Branch: main / root** 를 켜면
+  `https://<사용자>.github.io/<저장소>/` 주소로 어느 기기에서나 접속됩니다.
+- **데이터:** 편집 내용은 그 브라우저에 저장됩니다. 기기 간 이동/백업은 상단의
+  **Export**(내려받기) 와 **Import / 불러오기** 로 합니다. 데이터가 바뀌면
+  `build-static` 을 다시 실행해 `index.html` 을 갱신하세요(기존 편집분은
+  각 브라우저 저장이 유지).
 
 ## 데이터
 

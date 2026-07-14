@@ -15,9 +15,19 @@ Usage
     python3 youtube_gen_v20.py --data other.json   # 다른 데이터 파일 사용
     python3 youtube_gen_v20.py selftest        # 생성 로직 자체 점검
     python3 youtube_gen_v20.py generate --song "..." --artist "..." [옵션]  # 헤드리스 1회 생성
+    python3 youtube_gen_v20.py build-static    # 서버 없이 어디서나 열리는 index.html 생성
 
 데이터(youtube_data.json)는 스크립트 옆에 저장되며, 저장 시 원자적 쓰기 +
 번호 순환 백업(youtube_data_1..5.json)으로 보호됩니다.
+
+정적(브라우저 전용) 배포
+    `build-static` 는 현재 데이터를 통째로 넣은 단일 index.html 을 만듭니다. 이
+    파일은 서버가 전혀 필요 없어, 아이폰·안드로이드·PC·맥 어디서든 브라우저로
+    열기만 하면 동작하고(홈 화면에 앱처럼 설치 가능), GitHub Pages 등에 올리면
+    URL 하나로 공유됩니다. 편집 내용은 그 브라우저의 localStorage 에 저장되며,
+    기기 간 이동은 Export/Import(또는 저장소 커밋)로 합니다. 같은 index.html 을
+    youtube_gen_v20.py 가 서빙하면 자동으로 서버 모드로 전환되어 디스크의
+    youtube_data.json 을 직접 읽고 씁니다.
 """
 
 import os
@@ -404,8 +414,14 @@ def generate_description(data: dict, sel: dict) -> str:
 # ==========================================================================
 _WEB_PAGE = r"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <title>YouTube 설명 생성기</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1e1f22">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="YT설명">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235865f2'/%3E%3Ctext y='.92em' x='6' font-size='74'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E">
 <style>
 *{box-sizing:border-box}
 :root{--bg:#1e1f22;--card:#2b2d31;--card2:#26282c;--in:#1a1b1e;--bd:#3a3d44;--fg:#e4e6ea;--mut:#9aa6b2;--acc:#5865f2;--acc2:#4752c4;--ok:#57b97f;--warn:#e0a63c;--del:#d05a5a}
@@ -459,10 +475,12 @@ textarea{width:100%;background:var(--in);border:1px solid var(--bd);color:var(--
 <header>
   <h1>🎬 YouTube 설명 생성기</h1>
   <div class="toolbar">
+    <span id="modeBadge" class="tag" title="저장 위치"></span>
     <span id="status"></span>
+    <button class="sm" onclick="loadFromFile()">불러오기</button>
     <button class="sm" onclick="doBackup()">백업</button>
-    <button class="sm" onclick="openImport()">Import JSON</button>
-    <button class="sm" onclick="location.href='/api/export'">Export ⭳</button>
+    <button class="sm" onclick="openImport()">Import</button>
+    <button class="sm" onclick="exportData()">Export ⭳</button>
     <button class="sm primary" onclick="saveNow()">저장</button>
   </div>
 </header>
@@ -616,7 +634,13 @@ function el(id){ return document.getElementById(id); }
 function setStatus(t, cls){ const s=el('status'); s.textContent=t; s.className=cls||''; }
 function toast(t){ const e=el('toast'); e.textContent=t; e.classList.add('show'); setTimeout(()=>e.classList.remove('show'),1400); }
 
-// ---------------- API ----------------
+// ---------------- storage: server API, or static (localStorage) ----------------
+// The same page runs two ways. When served by youtube_gen_v20.py the /api/*
+// endpoints read/write youtube_data.json on disk. When opened as a standalone
+// file / hosted statically (GitHub Pages), there is no server: data lives in this
+// browser's localStorage, seeded once from the baked-in window.__SEED__.
+let MODE = 'server';
+const LS_KEY = 'youtube_gen_data_v20';
 async function apiGet(u){ const r=await fetch(u); return r.json(); }
 async function apiPost(u,b){ const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
 
@@ -627,6 +651,11 @@ function markDirty(){
 }
 async function saveNow(){
   clearTimeout(saveTimer);
+  if(MODE==='static'){
+    try{ localStorage.setItem(LS_KEY, JSON.stringify(DATA)); setStatus('저장됨(이 브라우저) ✓','ok'); }
+    catch(e){ setStatus('저장 실패: '+e,'err'); }
+    return;
+  }
   setStatus('저장 중…');
   try{
     const j=await apiPost('/api/save',{data:DATA});
@@ -635,8 +664,105 @@ async function saveNow(){
   }catch(e){ setStatus('저장 실패: '+e,'err'); }
 }
 async function doBackup(){
+  if(MODE==='static'){ exportData(true); return; }
   const j=await apiPost('/api/backup',{});
   toast(j.ok?('백업 생성: '+(j.name||'')):'백업 실패');
+}
+function pad2(n){ return (''+n).padStart(2,'0'); }
+function exportData(isBackup){
+  const blob=new Blob([JSON.stringify(DATA,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob), a=document.createElement('a');
+  let name='youtube_data.json';
+  if(isBackup){ const d=new Date();
+    name='youtube_data_backup_'+d.getFullYear()+pad2(d.getMonth()+1)+pad2(d.getDate())+'_'+pad2(d.getHours())+pad2(d.getMinutes())+pad2(d.getSeconds())+'.json'; }
+  a.href=url; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
+  toast((isBackup?'백업 내려받음: ':'내보냄: ')+name);
+}
+function loadFromFile(){
+  const fi=document.createElement('input'); fi.type='file'; fi.accept='.json,application/json';
+  fi.onchange=()=>{ const f=fi.files&&fi.files[0]; if(!f) return; const rd=new FileReader();
+    rd.onload=()=>{ try{ DATA=normalizeData(JSON.parse(rd.result)); renderAll(); saveNow(); toast('불러옴: '+f.name); }
+      catch(e){ toast('불러오기 실패: '+e); } };
+    rd.readAsText(f); };
+  fi.click();
+}
+
+// ---------------- data-model ports (mirror the Python helpers) ----------------
+function deepCopy(o){ return JSON.parse(JSON.stringify(o)); }
+function getDefaultData(){ return {
+  songs:{}, groups:{}, characters:{}, costumes:{}, mods:{},
+  song_categories:{"μ's":[],"Aqours":[],"Nijigasaki":[],"Solo":[],"Other":[]},
+  costume_categories:{"μ's":[],"Aqours":[],"Nijigasaki":[],"Event":[]},
+  character_costume_categories:{},
+  settings:{ aspect_ratios:["16:9","16:10","4:3","21:9"],
+    format_order:["{playlist}","{hashtags}","{japanese}","{korean}","{english}"],
+    languages:["japanese","korean","english"],
+    japanese_format:"{song} ({artist}, {mod}, {costume})[{ratio}][スクスタ {type}]",
+    korean_format:"{song} ({artist}, {mod}, {costume})[{ratio}][스쿠스타 {type}]",
+    english_format:"{song} ({artist}, {mod}, {costume})[{ratio}][SIFAS {type}]",
+    keep_mod_selection:false, enable_costume_category_filter:false, costume_category_whitelist:[] } };
+}
+function normalizeData(data){
+  const def=getDefaultData();
+  const out=(data && typeof data==='object' && !Array.isArray(data)) ? deepCopy(data) : {};
+  for(const k in def){ if(!(k in out)) out[k]=deepCopy(def[k]); }
+  const s=out.settings||(out.settings={});
+  for(const k in def.settings){ if(!(k in s)) s[k]=(def.settings[k]&&typeof def.settings[k]==='object')?deepCopy(def.settings[k]):def.settings[k]; }
+  if(!out.character_costume_categories) out.character_costume_categories={};
+  const cc=out.costume_categories||{};
+  if(cc && typeof cc==='object' && cc.Character && typeof cc.Character==='object' && !Array.isArray(cc.Character)){
+    for(const ch in cc.Character){ const lst=cc.Character[ch]; if(!Array.isArray(lst)) continue;
+      const uniq=[], seen=new Set();
+      for(const key of lst){ if((key in (out.costumes||{})) && !seen.has(key)){ uniq.push(key); seen.add(key); } }
+      out.character_costume_categories[ch]=out.character_costume_categories[ch]||{};
+      const merged=(out.character_costume_categories[ch].Default||[]).slice();
+      for(const k of uniq){ if(!merged.includes(k)) merged.push(k); }
+      out.character_costume_categories[ch].Default=merged;
+    }
+    try{ delete out.costume_categories.Character; }catch(e){}
+  }
+  return out;
+}
+function mergeListUnique(base, add){ if(!Array.isArray(base)) base=[]; const seen=new Set(base), out=base.slice();
+  for(const x of (add||[])){ if(!seen.has(x)){ out.push(x); seen.add(x); } } return out; }
+function looksLikeSongsMap(d){ if(!d||typeof d!=='object'||Array.isArray(d)) return false;
+  let cnt=0,hit=0; for(const v of Object.values(d).slice(0,10)){ cnt++; if(v&&typeof v==='object'&&('japanese'in v||'korean'in v||'english'in v)) hit++; }
+  return cnt>0 && hit/cnt>=0.6; }
+function mergeNonDestructive(dst, src){
+  const stats={songs_added:0,groups_added:0,characters_added:0,costumes_added:0,mods_added:0,
+    song_cat_updates:0,costume_cat_updates:0,char_costume_cat_updates:0,settings_filled:0};
+  for(const [sec,ks] of [['songs','songs_added'],['groups','groups_added'],['characters','characters_added'],['costumes','costumes_added'],['mods','mods_added']]){
+    dst[sec]=dst[sec]||{}; const s=src[sec]||{};
+    for(const k in s){ if(!(k in dst[sec])){ dst[sec][k]=s[k]; stats[ks]++; }
+      else if(dst[sec][k]&&typeof dst[sec][k]==='object'&&s[k]&&typeof s[k]==='object'){ for(const sk in s[k]){ if(!(sk in dst[sec][k])) dst[sec][k][sk]=s[k][sk]; } } }
+  }
+  dst.song_categories=dst.song_categories||{};
+  for(const cat in (src.song_categories||{})){ const b=(dst.song_categories[cat]||[]).length;
+    dst.song_categories[cat]=mergeListUnique(dst.song_categories[cat]||[], src.song_categories[cat]); stats.song_cat_updates+=Math.max(0,dst.song_categories[cat].length-b); }
+  dst.costume_categories=dst.costume_categories||{};
+  for(const cat in (src.costume_categories||{})){ const b=(dst.costume_categories[cat]||[]).length;
+    dst.costume_categories[cat]=mergeListUnique(dst.costume_categories[cat]||[], src.costume_categories[cat]); stats.costume_cat_updates+=Math.max(0,dst.costume_categories[cat].length-b); }
+  dst.character_costume_categories=dst.character_costume_categories||{};
+  const sccc=src.character_costume_categories||{};
+  for(const ch in sccc){ dst.character_costume_categories[ch]=dst.character_costume_categories[ch]||{};
+    for(const cat in (sccc[ch]||{})){ const b=(dst.character_costume_categories[ch][cat]||[]).length;
+      dst.character_costume_categories[ch][cat]=mergeListUnique(dst.character_costume_categories[ch][cat]||[], sccc[ch][cat]);
+      stats.char_costume_cat_updates+=Math.max(0,dst.character_costume_categories[ch][cat].length-b); } }
+  dst.settings=dst.settings||{};
+  for(const k in (src.settings||{})){ if(!(k in dst.settings)){ dst.settings[k]=src.settings[k]; stats.settings_filled++; } }
+  return stats;
+}
+function registerPWA(){
+  try{
+    const icon="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%235865f2'/%3E%3Ctext y='.92em' x='6' font-size='74'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E";
+    const mani={name:"YouTube 설명 생성기",short_name:"YT설명",display:"standalone",
+      background_color:"#1e1f22",theme_color:"#1e1f22",start_url:".",
+      icons:[{src:icon,sizes:"any",type:"image/svg+xml"}]};
+    const l=document.createElement('link'); l.rel='manifest';
+    l.href=URL.createObjectURL(new Blob([JSON.stringify(mani)],{type:'application/manifest+json'}));
+    document.head.appendChild(l);
+  }catch(e){}
 }
 
 // ---------------- generation (mirror of Python generate_description) --------
@@ -1143,6 +1269,17 @@ function openImport(){
   imp.onclick=async()=>{
     const text=ta.value.trim(); if(!text){ toast('내용이 없습니다'); return; }
     imp.disabled=true; imp.textContent='병합 중…';
+    if(MODE==='static'){
+      try{
+        const obj=JSON.parse(text);
+        let src=(obj && typeof obj==='object' && !('songs' in obj) && looksLikeSongsMap(obj)) ? {songs:obj} : obj;
+        src=normalizeData(src);
+        const st=mergeNonDestructive(DATA, src);
+        const added=st.songs_added+st.groups_added+st.characters_added+st.costumes_added+st.mods_added;
+        saveNow(); renderAll(); bg.remove(); toast('Import 완료: 항목 +'+added);
+      }catch(e){ imp.disabled=false; imp.textContent='Import'; toast('Import 실패: '+e); }
+      return;
+    }
     const j=await apiPost('/api/import',{text});
     if(j.ok){ DATA=j.data; renderAll(); bg.remove(); toast('Import 완료: '+(j.summary||'')); setStatus('저장됨 ✓','ok'); }
     else { imp.disabled=false; imp.textContent='Import'; toast('Import 실패: '+(j.error||'')); }
@@ -1170,14 +1307,36 @@ function renderAll(){
   renderRatios(); renderSolos(); renderMods(); renderFilter(); renderOrder(); renderFormats(); renderCharcos();
   generate();
 }
-async function boot(){
-  const j=await apiGet('/api/data');
-  DATA=j.data;
+function afterLoad(note){
   if(DATA.settings && DATA.settings.aspect_ratios && DATA.settings.aspect_ratios.length) S.ratio=DATA.settings.aspect_ratios[0];
+  const badge=el('modeBadge'); if(badge) badge.textContent = (MODE==='static') ? '💾 브라우저 저장' : '🖥 로컬 서버';
   renderAll();
-  setStatus('불러옴 ✓ '+(j.path?('('+j.path.split(/[\\/]/).pop()+')'):''),'ok');
+  setStatus('불러옴 ✓ '+(note||''),'ok');
+  registerPWA();
 }
-window.addEventListener('beforeunload',()=>{ if(saveTimer){ try{ navigator.sendBeacon('/api/save', new Blob([JSON.stringify({data:DATA})],{type:'application/json'})); }catch(e){} } });
+async function boot(){
+  // Static when a seed is baked in (built index.html) or when no server is reachable.
+  if(typeof window.__SEED__ !== 'undefined' || window.__STATIC__){
+    MODE='static';
+    let saved=null; try{ saved=localStorage.getItem(LS_KEY); }catch(e){}
+    DATA=normalizeData(saved ? JSON.parse(saved) : (window.__SEED__||{}));
+    afterLoad('정적 모드');
+    return;
+  }
+  try{
+    const j=await apiGet('/api/data');
+    MODE='server'; DATA=j.data;
+    afterLoad(j.path?('('+j.path.split(/[\\/]/).pop()+')'):'');
+  }catch(e){
+    MODE='static';
+    let saved=null; try{ saved=localStorage.getItem(LS_KEY); }catch(_){}
+    DATA=normalizeData(saved ? JSON.parse(saved) : {});
+    afterLoad('정적 모드');
+  }
+}
+window.addEventListener('beforeunload',()=>{
+  if(MODE==='server' && saveTimer){ try{ navigator.sendBeacon('/api/save', new Blob([JSON.stringify({data:DATA})],{type:'application/json'})); }catch(e){} }
+});
 boot();
 </script></body></html>"""
 
@@ -1499,6 +1658,22 @@ def selftest():
 # ==========================================================================
 # main / argparse
 # ==========================================================================
+def build_static(data_path=DATA_FILE, out=None):
+    """Write a standalone index.html that runs with NO server: the current data is
+    baked in as a seed and the app persists to the browser's localStorage. Open it
+    on any device (phone/tablet/PC/Mac) or host it on GitHub Pages."""
+    data = ensure_data(data_path)
+    out = out or str(Path(__file__).with_name("index.html"))
+    seed = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")  # keep it inside <script>
+    inject = "<body>\n<script>window.__SEED__=" + seed + ";window.__STATIC__=true;</script>"
+    html = _WEB_PAGE.replace("<body>", inject, 1)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(html)
+    print("[build-static] wrote %s (%d KB)" % (out, len(html.encode("utf-8")) // 1024))
+    print("[build-static] 이 파일을 열기만 하면 브라우저에서 바로 동작합니다 (서버 불필요).")
+    return out
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="SIFAS/스쿠스타 YouTube 설명 생성기 (web UI).")
     p.add_argument("--web", action="store_true", help="launch the browser-based interface (default)")
@@ -1518,6 +1693,9 @@ def build_parser():
     g.add_argument("--mods", default="", help="comma-separated mod keys")
     g.add_argument("--solos", default="", help="comma-separated character keys (for atype=characters)")
     sub.add_parser("selftest", help="check the generation logic")
+    bs = sub.add_parser("build-static", help="write a standalone index.html (no server; any browser)")
+    bs.add_argument("--data", default=DATA_FILE)
+    bs.add_argument("--out", default=None, help="output path (default: index.html next to this script)")
     return p
 
 
@@ -1527,6 +1705,9 @@ def main(argv=None):
         sys.exit(0 if selftest() else 1)
     if a.cmd == "generate":
         cli_generate(a)
+        return
+    if a.cmd == "build-static":
+        build_static(a.data, a.out)
         return
     # default: web UI
     run_web(data_path=a.data, open_browser=not a.no_browser, host=a.host, port=a.port)
